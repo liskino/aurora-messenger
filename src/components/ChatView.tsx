@@ -1,10 +1,22 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { AlertCircle, ArrowLeft, Paperclip, Send, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  AlertCircle,
+  ArrowLeft,
+  Image as ImageIcon,
+  Paperclip,
+  Phone,
+  Send,
+  Settings2,
+  ShieldCheck,
+  Video,
+} from 'lucide-react'
 import { engine } from '@/lib/engine'
+import { calls, rtcSupported } from '@/lib/rtc'
 import { timed } from '@/lib/perf'
 import type { Chat, DecryptedMessage, Profile } from '@/lib/types'
 import { useVirtualList } from '@/hooks/useVirtualList'
 import { MessageBubble } from './MessageBubble'
+import { Avatar } from './Avatar'
 
 interface Props {
   chat: Chat
@@ -12,6 +24,7 @@ interface Props {
   members: Profile[]
   selfId: string
   onBack: () => void
+  onOpenGroup: () => void
 }
 
 /**
@@ -24,14 +37,19 @@ interface Props {
  *  • отправка оптимистична: пузырь появляется мгновенно, сеть догоняет;
  *  • ввод текста не трогает список — состояние ввода отделено от сообщений.
  */
-export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
+export function ChatView({ chat, peer, members, selfId, onBack, onOpenGroup }: Props) {
   const [messages, setMessages] = useState<DecryptedMessage[]>(() => engine.cachedMessages(chat.id))
   const [draft, setDraft] = useState('')
   const [typingUser, setTypingUser] = useState<string | null>(null)
   const [uploading, setUploading] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [preview, setPreview] = useState<{ url: string; type: string } | null>(null)
+  /** Перерисовка реакций и отметок: данные живут в движке, здесь повод обновиться. */
+  const [reactionsTick, setReactionsTick] = useState(0)
+  const [receiptsTick, setReceiptsTick] = useState(0)
   const stickToBottom = useRef(true)
   const fileInput = useRef<HTMLInputElement | null>(null)
+  const imageInput = useRef<HTMLInputElement | null>(null)
 
   const { containerRef, virtual, total, measure, scrollToBottom, resetMetrics } =
     useVirtualList(messages)
@@ -39,15 +57,18 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
   // Загрузка истории: замеряем, чтобы видеть реальную скорость на устройстве.
   useEffect(() => {
     let cancelled = false
-    // Высоты строк другого чата не имеют отношения к этому — сбрасываем,
-    // иначе первые позиции будут посчитаны по чужой геометрии.
+    // Высоты строк другого чата не имеют отношения к этому — сбрасываем.
     resetMetrics()
     setMessages(engine.cachedMessages(chat.id))
     ;(async () => {
       try {
         const history = await timed('chat_history_load', () => engine.loadHistory(chat.id))
-        if (!cancelled) setMessages([...history])
+        if (cancelled) return
+        setMessages([...history])
         void engine.markChatRead(chat.id)
+        // Реакции и отметки грузим отдельно: без них история откроется быстрее.
+        void engine.loadReactions(chat.id).then(() => setReactionsTick((t) => t + 1))
+        void engine.loadReceipts(chat.id).then(() => setReceiptsTick((t) => t + 1))
       } catch (e) {
         if (!cancelled) setError((e as Error).message)
       }
@@ -57,19 +78,28 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
     }
   }, [chat.id, resetMetrics])
 
-  // Новые сообщения и «печатает» из realtime.
+  // Слушаем входящие звонки, пока открыт этот чат.
+  useEffect(() => {
+    calls.listenForCalls(chat.id, selfId)
+    return () => calls.stopListening()
+  }, [chat.id, selfId])
+
+  // Новые сообщения, правки, удаления, реакции и «печатает» из realtime.
   useEffect(() => {
     const off = engine.on((e) => {
       if (e.type === 'message' && e.chatId === chat.id) {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === e.message.id)) return prev
-          return [...prev, e.message]
-        })
-        if (e.message.sender_id !== selfId) {
-          void engine.markChatRead(chat.id)
-        }
+        setMessages((prev) => (prev.some((m) => m.id === e.message.id) ? prev : [...prev, e.message]))
+        if (e.message.sender_id !== selfId) void engine.markChatRead(chat.id)
       } else if (e.type === 'typing' && e.chatId === chat.id) {
         setTypingUser(e.userId)
+      } else if (e.type === 'deleted' && e.chatId === chat.id) {
+        setMessages((prev) => prev.filter((m) => m.id !== e.messageId))
+      } else if (e.type === 'edited' && e.chatId === chat.id) {
+        setMessages((prev) => prev.map((m) => (m.id === e.message.id ? e.message : m)))
+      } else if (e.type === 'reactions' && e.chatId === chat.id) {
+        setReactionsTick((t) => t + 1)
+      } else if (e.type === 'receipts' && e.chatId === chat.id) {
+        setReceiptsTick((t) => t + 1)
       }
     })
     return () => {
@@ -88,18 +118,18 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
     if (stickToBottom.current) scrollToBottom(false)
   }, [messages, scrollToBottom])
 
-  const onScrollStick = () => {
+  const onScrollStick = useCallback(() => {
     const el = containerRef.current
     if (!el) return
     stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140
-  }
+  }, [containerRef])
 
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
     el.addEventListener('scroll', onScrollStick, { passive: true })
     return () => el.removeEventListener('scroll', onScrollStick)
-  }, [containerRef])
+  }, [containerRef, onScrollStick])
 
   const send = async () => {
     const text = draft.trim()
@@ -110,7 +140,7 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
       await timed('send_message', () => engine.sendText(chat.id, text))
     } catch (e) {
       setError((e as Error).message)
-      setDraft(text)
+      setDraft(text) // возвращаем текст: терять написанное из-за сети нельзя
     }
   }
 
@@ -125,11 +155,39 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
     }
   }
 
+  /** Картинку показываем прямо в переписке, не заставляя скачивать файл. */
+  const previewImage = async (m: DecryptedMessage) => {
+    try {
+      const blob = await engine.downloadFile(m)
+      const url = URL.createObjectURL(blob)
+      setPreview({ url, type: m.file_type ?? 'image/png' })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  useEffect(() => {
+    if (!preview) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closePreview()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preview])
+
+  const closePreview = () => {
+    if (preview) URL.revokeObjectURL(preview.url)
+    setPreview(null)
+  }
+
   const title = chat.kind === 'group' ? (chat.title ?? 'Группа') : (peer?.display_name ?? 'Чат')
   const subtitle = chat.kind === 'group' ? `${members.length} участников` : '@' + (peer?.username ?? '')
+  const peerOnline = peer ? engine.isOnline(peer.id) : false
 
   const typingName = useMemo(
-    () => (typingUser ? (members.find((m) => m.id === typingUser)?.display_name ?? 'Кто-то') : null),
+    () =>
+      typingUser ? (members.find((m) => m.id === typingUser)?.display_name ?? 'Кто-то') : null,
     [typingUser, members],
   )
 
@@ -143,7 +201,12 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
         >
           <ArrowLeft size={18} />
         </button>
-        <Avatar name={title} id={peer?.id ?? chat.id} />
+        <div className="relative">
+          <Avatar name={title} id={peer?.id ?? chat.id} />
+          {peerOnline && (
+            <span className="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-ink-850 bg-emerald-400" />
+          )}
+        </div>
         <div className="min-w-0 flex-1">
           <h2 className="truncate font-semibold text-white">{title}</h2>
           <p className="flex items-center gap-1 truncate text-xs text-mist-400">
@@ -152,11 +215,47 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
             ) : (
               <>
                 <ShieldCheck size={11} className="text-aqua-500" />
-                {subtitle} · сквозное шифрование
+                {peerOnline && chat.kind === 'direct' ? 'в сети · ' : ''}
+                {subtitle}
               </>
             )}
           </p>
         </div>
+
+        {/* Звонки */}
+        <button
+          onClick={() => {
+            void calls
+              .startCall(chat.id, selfId, 'audio', title)
+              .catch((e) => setError((e as Error).message))
+          }}
+          disabled={!rtcSupported()}
+          title={rtcSupported() ? 'Голосовой звонок' : 'Звонки работают только по HTTPS'}
+          className="grid size-9 place-items-center rounded-xl text-mist-300 transition-transform duration-150 hover:bg-white/5 active:scale-95 disabled:opacity-35"
+        >
+          <Phone size={17} />
+        </button>
+        <button
+          onClick={() => {
+            void calls
+              .startCall(chat.id, selfId, 'video', title)
+              .catch((e) => setError((e as Error).message))
+          }}
+          disabled={!rtcSupported()}
+          title={rtcSupported() ? 'Видеозвонок' : 'Звонки работают только по HTTPS'}
+          className="grid size-9 place-items-center rounded-xl text-mist-300 transition-transform duration-150 hover:bg-white/5 active:scale-95 disabled:opacity-35"
+        >
+          <Video size={17} />
+        </button>
+        {chat.kind === 'group' && (
+          <button
+            onClick={onOpenGroup}
+            title="Участники и настройки группы"
+            className="grid size-9 place-items-center rounded-xl text-mist-300 transition-transform duration-150 hover:bg-white/5 active:scale-95"
+          >
+            <Settings2 size={17} />
+          </button>
+        )}
       </header>
 
       {/* Список сообщений */}
@@ -180,11 +279,44 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
                   message={m}
                   own={m.sender_id === selfId}
                   showTail={!prev || prev.sender_id !== m.sender_id}
-                  onDownload={(msg) => engine.downloadFile(msg)}
+                  delivered={!m.id.startsWith('local-')}
+                  read={engine.isRead(m.id)}
+                  myReaction={engine.reactionFor(m.id, selfId)}
+                  reactions={engine.reactionsOf(m.id)}
+                  actions={{
+                    onDownload: async (msg) => {
+                      const blob = await engine.downloadFile(msg)
+                      if (msg.file_type?.startsWith('image/')) {
+                        void previewImage(msg)
+                      }
+                      return blob
+                    },
+                    onDelete: (msg) => {
+                      void engine
+                        .deleteMessage(chat.id, msg.id)
+                        .catch((e) => setError((e as Error).message))
+                    },
+                    onEdit: (msg, text) => {
+                      void engine
+                        .editMessage(chat.id, msg.id, text)
+                        .catch((e) => setError((e as Error).message))
+                    },
+                    onReact: (msg, emoji) => {
+                      void engine
+                        .toggleReaction(chat.id, msg.id, emoji)
+                        .catch((e) => setError((e as Error).message))
+                    },
+                  }}
                 />
               </div>
             )
           })}
+          {/* Тики нужны, чтобы перерисовка произошла при изменении реакций
+              и отметок прочтения: сами данные живут в движке. */}
+          <span style={{ display: 'none' }}>
+            {reactionsTick}
+            {receiptsTick}
+          </span>
         </div>
 
         {!messages.length && (
@@ -201,16 +333,14 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
       {error && (
         <div className="anim-fade flex items-center gap-2 bg-red-500/10 px-4 py-2 text-xs text-red-300">
           <AlertCircle size={13} />
-          {error}
-          <button onClick={() => setError(null)} className="ml-auto opacity-70 hover:opacity-100">
+          <span className="flex-1">{error}</span>
+          <button onClick={() => setError(null)} className="opacity-70 hover:opacity-100">
             скрыть
           </button>
         </div>
       )}
 
-      {uploading !== null && (
-        <div className="shimmer h-0.5 bg-brand-500/40" />
-      )}
+      {uploading !== null && <div className="shimmer h-0.5 bg-brand-500/40" />}
 
       {/* Поле ввода */}
       <div className="border-t border-white/5 bg-ink-850/80 px-3 py-3 backdrop-blur-xl">
@@ -225,12 +355,30 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
               e.target.value = ''
             }}
           />
+          <input
+            ref={imageInput}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) void attach(f)
+              e.target.value = ''
+            }}
+          />
           <button
             onClick={() => fileInput.current?.click()}
             className="grid size-10 shrink-0 place-items-center rounded-xl text-mist-300 transition-transform duration-150 will-change-transform hover:bg-white/5 active:scale-95"
             title="Отправить файл (шифруется)"
           >
             <Paperclip size={18} />
+          </button>
+          <button
+            onClick={() => imageInput.current?.click()}
+            className="grid size-10 shrink-0 place-items-center rounded-xl text-mist-300 transition-transform duration-150 will-change-transform hover:bg-white/5 active:scale-95"
+            title="Отправить изображение (шифруется)"
+          >
+            <ImageIcon size={18} />
           </button>
 
           <textarea
@@ -260,29 +408,24 @@ export function ChatView({ chat, peer, members, selfId, onBack }: Props) {
           </button>
         </div>
       </div>
-    </div>
-  )
-}
 
-export function Avatar({ name, id, size = 40 }: { name: string; id: string; size?: number }) {
-  // Цвет выводим из id: он стабилен между сессиями и не требует запроса.
-  const hue = [...id].reduce((a, c) => a + c.charCodeAt(0), 0) % 360
-  const initials = name
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((w) => w[0]?.toUpperCase() ?? '')
-    .join('')
-  return (
-    <div
-      className="grid shrink-0 place-items-center rounded-full font-semibold text-white"
-      style={{
-        width: size,
-        height: size,
-        fontSize: size * 0.38,
-        background: `linear-gradient(135deg, hsl(${hue} 70% 52%), hsl(${(hue + 55) % 360} 75% 44%))`,
-      }}
-    >
-      {initials || '?'}
+      {/* Просмотр изображения */}
+      {preview && (
+        <div
+          className="anim-fade fixed inset-0 z-50 grid place-items-center bg-black/85 p-4"
+          onClick={closePreview}
+        >
+          <img
+            src={preview.url}
+            alt=""
+            className="anim-pop max-h-full max-w-full rounded-xl object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
+          <p className="absolute bottom-5 text-xs text-mist-400">
+            Расшифровано на вашем устройстве · нажмите, чтобы закрыть
+          </p>
+        </div>
+      )}
     </div>
   )
 }

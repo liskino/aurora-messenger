@@ -103,6 +103,18 @@ create table if not exists public.typing (
   primary key (chat_id, user_id)
 );
 
+-- ─────────────────────────── реакции ───────────────────────────
+
+create table if not exists public.reactions (
+  message_id uuid not null references public.messages(id) on delete cascade,
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  emoji      text not null check (char_length(emoji) between 1 and 8),
+  created_at timestamptz not null default now(),
+  primary key (message_id, user_id)
+);
+
+create index if not exists reactions_message_idx on public.reactions (message_id);
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Row Level Security: каждый видит только свои чаты
 -- ═══════════════════════════════════════════════════════════════════════
@@ -114,6 +126,7 @@ alter table public.messages     enable row level security;
 alter table public.devices      enable row level security;
 alter table public.receipts     enable row level security;
 alter table public.typing       enable row level security;
+alter table public.reactions    enable row level security;
 
 -- Помощник: состоит ли текущий пользователь в чате
 create or replace function public.is_member(chat uuid)
@@ -177,6 +190,34 @@ drop policy if exists messages_update on public.messages;
 create policy messages_update on public.messages
   for update to authenticated using (sender_id = auth.uid());
 
+-- Удалять можно только свои сообщения. Иначе любой участник чата мог бы
+-- стереть чужую переписку.
+drop policy if exists messages_delete on public.messages;
+create policy messages_delete on public.messages
+  for delete to authenticated using (sender_id = auth.uid());
+
+-- reactions
+drop policy if exists reactions_read on public.reactions;
+create policy reactions_read on public.reactions
+  for select to authenticated using (
+    exists (select 1 from public.messages m where m.id = message_id and public.is_member(m.chat_id))
+  );
+
+drop policy if exists reactions_write on public.reactions;
+create policy reactions_write on public.reactions
+  for all to authenticated
+  using (user_id = auth.uid())
+  with check (
+    user_id = auth.uid()
+    and exists (select 1 from public.messages m where m.id = message_id and public.is_member(m.chat_id))
+  );
+
+-- Участник может выйти из чата, но не может выкинуть создателя группы.
+-- Удаление чата целиком — только создателю.
+drop policy if exists chats_delete on public.chats;
+create policy chats_delete on public.chats
+  for delete to authenticated using (created_by = auth.uid());
+
 -- devices
 drop policy if exists devices_all on public.devices;
 create policy devices_all on public.devices
@@ -210,6 +251,7 @@ alter publication supabase_realtime add table public.messages;
 alter publication supabase_realtime add table public.typing;
 alter publication supabase_realtime add table public.receipts;
 alter publication supabase_realtime add table public.chat_members;
+alter publication supabase_realtime add table public.reactions;
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Автосоздание профиля-заглушки при регистрации (ключи заполняет клиент)

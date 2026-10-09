@@ -43,6 +43,11 @@ export type EngineEvent =
   | { type: 'message'; chatId: string; message: DecryptedMessage }
   | { type: 'typing'; chatId: string; userId: string }
   | { type: 'chat'; chat: Chat }
+  | { type: 'deleted'; chatId: string; messageId: string }
+  | { type: 'edited'; chatId: string; message: DecryptedMessage }
+  | { type: 'reactions'; chatId: string; messageId: string }
+  | { type: 'receipts'; chatId: string }
+  | { type: 'presence' }
   | { type: 'error'; error: Error }
 
 type Listener = (e: EngineEvent) => void
@@ -67,10 +72,24 @@ export class Engine {
   private seen = new Set<string>()
   private typingTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private deviceKeyPromise: Promise<CryptoKey> | null = null
+  /** Реакции: messageId → (userId → эмодзи). */
+  private reactions = new Map<string, Map<string, string>>()
+  /** Кто сейчас в сети. */
+  private online = new Set<string>()
+  private presenceChannel: ReturnType<typeof api.supabase.channel> | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  /** Отметки доставки и прочтения: messageId → состояние. */
+  private receipts = new Map<string, { delivered: boolean; read: boolean }>()
+  /** Идентификатор записи этого устройства — для отметки присутствия. */
+  deviceId: string | null = null
 
   on(fn: Listener) {
     this.listeners.add(fn)
-    return () => this.listeners.delete(fn)
+    // Возвращаем именно void-функцию: React-эффект не примет функцию,
+    // возвращающую значение, — иначе он станет функцией очистки странного вида.
+    return () => {
+      this.listeners.delete(fn)
+    }
   }
 
   private emit(e: EngineEvent) {
@@ -116,7 +135,7 @@ export class Engine {
       chatKeys: new Map(),
       localWrapped: new Map(),
     }
-    await api.touchLastSeen(user.id)
+    await this.beginSession()
     return this.session
   }
 
@@ -143,7 +162,7 @@ export class Engine {
       chatKeys: new Map(),
       localWrapped: new Map(),
     }
-    await api.touchLastSeen(supa.user.id)
+    await this.beginSession()
     return this.session
   }
 
@@ -199,7 +218,7 @@ export class Engine {
         chatKeys: new Map(),
         localWrapped: new Map(),
       }
-      await api.touchLastSeen(supa.user.id)
+      await this.beginSession()
       return this.session
     } catch {
       return null
@@ -213,16 +232,52 @@ export class Engine {
     this.deviceKeyPromise = Promise.resolve(deviceKey)
   }
 
+  /**
+   * Регистрирует это устройство в аккаунте и оживляет присутствие.
+   *
+   * Вызывается после успешного входа: список устройств нужен человеку,
+   * чтобы видеть, где ещё открыт мессенджер, а присутствие — чтобы
+   * собеседник знал, что он не пишет в пустоту.
+   */
+  private async beginSession() {
+    const me = this.session
+    if (!me) return
+
+    try {
+      const device = await api.registerDevice(me.userId, api.deviceLabel())
+      this.deviceId = device.id
+    } catch {
+      // Список устройств — вспомогательная функция, вход из-за неё не срываем.
+    }
+
+    this.startPresence()
+
+    // Отметку присутствия обновляем редко: чаще нет смысла, а нагрузка растёт.
+    if (!this.heartbeatTimer) {
+      this.heartbeatTimer = setInterval(() => {
+        if (this.deviceId) void api.heartbeat(this.deviceId)
+      }, 60_000)
+    }
+    void api.touchLastSeen(me.userId)
+  }
+
   async logout() {
     if (this.session) await vault.forgetDevice(this.session.userId)
     for (const ch of this.channels.values()) api.supabase.removeChannel(ch)
     this.channels.clear()
+    this.stopPresence()
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
     this.messageCache.clear()
     this.profiles.clear()
     this.chatCache.clear()
     this.membership.clear()
+    this.reactions.clear()
     this.seen.clear()
     this.deviceKeyPromise = null
+    this.deviceId = null
     this.session = null
     await api.signOut()
   }
@@ -586,8 +641,38 @@ export class Engine {
           this.pushToCache(chatId, msg)
           this.emit({ type: 'message', chatId, message: msg })
           if (m.sender_id !== this.session!.userId) {
-            void api.markDelivered([m.id], this.session!.userId)
+            void api.markDelivered([m.id], this.session!.userId).then(() => {
+              this.receipts.set(m.id, { delivered: true, read: false })
+            })
           }
+        },
+      )
+      // Правка и удаление чужих изменений не приходят: RLS пускает только
+      // свои строки. Но своё сообщение, изменённое на другом устройстве,
+      // должно обновиться и здесь.
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
+        async ({ new: row }) => {
+          const m = row as Message
+          if (!this.seen.has(m.id)) return
+          const key = await this.keyForChat(chatId)
+          const msg = await this.decryptOne(m, key)
+          const list = (this.messageCache.get(chatId) ?? []).map((x) => (x.id === m.id ? msg : x))
+          this.messageCache.set(chatId, list)
+          this.emit({ type: 'edited', chatId, message: msg })
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: 'DELETE', schema: 'public', table: 'messages' },
+        ({ old: row }) => {
+          const id = (row as { id?: string })?.id
+          if (!id) return
+          const list = (this.messageCache.get(chatId) ?? []).filter((m) => m.id !== id)
+          this.messageCache.set(chatId, list)
+          this.seen.delete(id)
+          this.emit({ type: 'deleted', chatId, messageId: id })
         },
       )
       .on(
@@ -597,6 +682,33 @@ export class Engine {
           const r = row as { user_id?: string } | null
           if (!r?.user_id || r.user_id === this.session?.userId) return
           this.emit({ type: 'typing', chatId, userId: r.user_id })
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'reactions' },
+        ({ new: row }) => {
+          const r = row as { message_id?: string; user_id?: string; emoji?: string } | null
+          if (!r?.message_id || !r.user_id || !r.emoji) return
+          const set = this.reactions.get(r.message_id) ?? new Map<string, string>()
+          set.set(r.user_id, r.emoji)
+          this.reactions.set(r.message_id, set)
+          this.emit({ type: 'reactions', chatId, messageId: r.message_id })
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'receipts' },
+        ({ new: row }) => {
+          const r = row as { message_id?: string; user_id?: string; delivered_at?: string; read_at?: string } | null
+          // Свои отметки игнорируем: они говорят о том, что читаем мы, а не нам.
+          if (!r?.message_id || r.user_id === this.session?.userId) return
+          const prev = this.receipts.get(r.message_id) ?? { delivered: false, read: false }
+          this.receipts.set(r.message_id, {
+            delivered: prev.delivered || Boolean(r.delivered_at),
+            read: prev.read || Boolean(r.read_at),
+          })
+          this.emit({ type: 'receipts', chatId })
         },
       )
       .subscribe()
@@ -632,11 +744,174 @@ export class Engine {
     const incoming = (this.messageCache.get(chatId) ?? [])
       .filter((m) => m.sender_id !== me.userId)
       .map((m) => m.id)
-    if (incoming.length) await api.markRead(incoming, me.userId)
+    if (!incoming.length) return
+    await api.markRead(incoming, me.userId)
+    // Локально помечаем прочитанными сразу: ждать ответа сервера для галочки
+    // в интерфейсе незачем.
+    for (const id of incoming) this.receipts.set(id, { delivered: true, read: true })
+    this.emit({ type: 'receipts', chatId })
+  }
+
+  /** Загружает отметки доставки и прочтения для истории чата. */
+  async loadReceipts(chatId: string): Promise<void> {
+    const me = this.session
+    if (!me) return
+    const ids = (this.messageCache.get(chatId) ?? []).map((m) => m.id)
+    if (!ids.length) return
+    const rows = await api.fetchReceipts(ids)
+    for (const r of rows) {
+      if (r.user_id === me.userId) continue // свои отметки не считаются
+      const prev = this.receipts.get(r.message_id) ?? { delivered: false, read: false }
+      this.receipts.set(r.message_id, {
+        delivered: prev.delivered || Boolean(r.delivered_at),
+        read: prev.read || Boolean(r.read_at),
+      })
+    }
+    this.emit({ type: 'receipts', chatId })
+  }
+
+  /** Доставлено ли моё сообщение собеседнику. */
+  isDelivered(messageId: string): boolean {
+    return this.receipts.get(messageId)?.delivered ?? false
+  }
+
+  /** Прочитано ли моё сообщение. */
+  isRead(messageId: string): boolean {
+    return this.receipts.get(messageId)?.read ?? false
+  }
+
+  /** Сколько непрочитанных в чате — для счётчика в списке. */
+  unreadCount(chatId: string): number {
+    const me = this.session
+    if (!me) return 0
+    return (this.messageCache.get(chatId) ?? []).filter(
+      (m) => m.sender_id !== me.userId && !this.receipts.get(m.id)?.read,
+    ).length
   }
 
   cachedMessages(chatId: string): DecryptedMessage[] {
     return this.messageCache.get(chatId) ?? []
+  }
+
+  // ═════════════════════════ редактирование и удаление ═════════════════════════
+
+  /** Удалить своё сообщение. */
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    const me = this.session
+    if (!me) throw new Error('Нет активной сессии')
+
+    const cached = this.messageCache.get(chatId)?.find((m) => m.id === messageId)
+    if (cached && cached.sender_id !== me.userId) {
+      throw new Error('Можно удалять только свои сообщения')
+    }
+
+    await api.deleteMessage(messageId)
+    this.seen.delete(messageId)
+    const list = (this.messageCache.get(chatId) ?? []).filter((m) => m.id !== messageId)
+    this.messageCache.set(chatId, list)
+    this.emit({ type: 'deleted', chatId, messageId })
+  }
+
+  /** Изменить текст своего сообщения: шифруем заново, старый шифротекст стираем. */
+  async editMessage(chatId: string, messageId: string, newText: string): Promise<void> {
+    const me = this.session
+    if (!me) throw new Error('Нет активной сессии')
+
+    const cached = this.messageCache.get(chatId)?.find((m) => m.id === messageId)
+    if (!cached) throw new Error('Сообщение не найдено')
+    if (cached.sender_id !== me.userId) throw new Error('Можно изменять только свои сообщения')
+
+    const key = await this.keyForChat(chatId)
+    const sealed = await crypto.sealTextAAD(newText, key, aadFor(chatId, me.userId))
+
+    const { error } = await api.supabase
+      .from('messages')
+      .update({
+        ciphertext: sealed.ciphertext,
+        iv: sealed.iv,
+        edited_at: new Date().toISOString(),
+      })
+      .eq('id', messageId)
+    if (error) throw error
+
+    const updated: DecryptedMessage = {
+      ...cached,
+      ciphertext: sealed.ciphertext,
+      iv: sealed.iv,
+      text: newText,
+      edited_at: new Date().toISOString(),
+    }
+    const list = (this.messageCache.get(chatId) ?? []).map((m) => (m.id === messageId ? updated : m))
+    this.messageCache.set(chatId, list)
+    this.emit({ type: 'edited', chatId, message: updated })
+  }
+
+  // ═════════════════════════ реакции ═════════════════════════
+
+  /** Поставить или снять реакцию. */
+  async toggleReaction(chatId: string, messageId: string, emoji: string): Promise<void> {
+    const me = this.session
+    if (!me) throw new Error('Нет активной сессии')
+
+    const current = this.reactions.get(messageId)
+    if (current?.has(me.userId)) {
+      await api.removeReaction(messageId, me.userId)
+      current.delete(me.userId)
+      if (!current.size) this.reactions.delete(messageId)
+    } else {
+      await api.addReaction(messageId, me.userId, emoji)
+      const set = current ?? new Map<string, string>()
+      set.set(me.userId, emoji)
+      this.reactions.set(messageId, set)
+    }
+    this.emit({ type: 'reactions', chatId, messageId })
+  }
+
+  reactionFor(messageId: string, userId: string): string | undefined {
+    return this.reactions.get(messageId)?.get(userId)
+  }
+
+  reactionsOf(messageId: string): { emoji: string; count: number }[] {
+    const map = this.reactions.get(messageId)
+    if (!map) return []
+    const counts = new Map<string, number>()
+    for (const emoji of map.values()) counts.set(emoji, (counts.get(emoji) ?? 0) + 1)
+    return [...counts.entries()].map(([emoji, count]) => ({ emoji, count }))
+  }
+
+  async loadReactions(chatId: string): Promise<void> {
+    const ids = (this.messageCache.get(chatId) ?? []).map((m) => m.id)
+    if (!ids.length) return
+    const rows = await api.fetchReactions(ids)
+    for (const r of rows) {
+      const set = this.reactions.get(r.message_id) ?? new Map<string, string>()
+      set.set(r.user_id, r.emoji)
+      this.reactions.set(r.message_id, set)
+    }
+    this.emit({ type: 'reactions', chatId, messageId: '*' })
+  }
+
+  // ═════════════════════════ присутствие ═════════════════════════
+
+  /** Кто сейчас в сети. Обновляется автоматически при входе и выходе. */
+  startPresence() {
+    const me = this.session
+    if (!me || this.presenceChannel) return
+    this.presenceChannel = api.presenceChannel(me.userId, (online) => {
+      this.online = new Set(online)
+      this.emit({ type: 'presence' })
+    })
+  }
+
+  stopPresence() {
+    if (!this.presenceChannel) return
+    void api.supabase.removeChannel(this.presenceChannel)
+    this.presenceChannel = null
+    this.online.clear()
+  }
+
+  isOnline(userId: string): boolean {
+    return this.online.has(userId)
   }
 
   // ═════════════════════════ производительность ═════════════════════════

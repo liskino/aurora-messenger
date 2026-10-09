@@ -15,7 +15,7 @@
 import { StrictMode, useEffect, useRef, useState } from 'react'
 import { createRoot, flushSync } from 'react-dom'
 import { useVirtualList } from '@/hooks/useVirtualList'
-import { MessageBubble } from '@/components/MessageBubble'
+import { MessageBubble, type MessageActions } from '@/components/MessageBubble'
 import { measureRefreshRate } from '@/lib/perf'
 import '@/index.css'
 import type { DecryptedMessage } from '@/lib/types'
@@ -55,6 +55,14 @@ function makeMessages(count: number): DecryptedMessage[] {
   return out
 }
 
+/** Действия для стенда: настоящие обработчики не нужны, важна только отрисовка. */
+const BENCH_ACTIONS: MessageActions = {
+  onDownload: async () => new Blob(),
+  onDelete: () => {},
+  onEdit: () => {},
+  onReact: () => {},
+}
+
 /** Виртуализированный список — тот же код и тот же компонент, что в приложении. */
 function VirtualChat({ messages }: { messages: DecryptedMessage[] }) {
   const { containerRef, virtual, total, measure } = useVirtualList(messages)
@@ -79,7 +87,10 @@ function VirtualChat({ messages }: { messages: DecryptedMessage[] }) {
                 message={m}
                 own={m.sender_id === SELF}
                 showTail={!prev || prev.sender_id !== m.sender_id}
-                onDownload={async () => new Blob()}
+                delivered
+                read={false}
+                reactions={[]}
+                actions={BENCH_ACTIONS}
               />
             </div>
           )
@@ -99,7 +110,10 @@ function NaiveChat({ messages }: { messages: DecryptedMessage[] }) {
             message={m}
             own={m.sender_id === SELF}
             showTail={!messages[i - 1] || messages[i - 1].sender_id !== m.sender_id}
-            onDownload={async () => new Blob()}
+            delivered
+            read={false}
+            reactions={[]}
+            actions={BENCH_ACTIONS}
           />
         </div>
       ))}

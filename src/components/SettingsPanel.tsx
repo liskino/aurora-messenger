@@ -1,16 +1,20 @@
 import { useEffect, useState } from 'react'
 import {
   Activity,
+  Bell,
   Fingerprint,
   Loader2,
   LogOut,
   MonitorSmartphone,
+  PhoneCall,
   ShieldCheck,
   Trash2,
   X,
 } from 'lucide-react'
 import { engine } from '@/lib/engine'
 import { fingerprint } from '@/lib/crypto'
+import { checkDevices, hasTurn, rtcSupported } from '@/lib/rtc'
+import { notificationsAllowed, requestNotificationPermission } from '@/lib/notify'
 import type { Device } from '@/lib/types'
 
 interface Props {
@@ -32,18 +36,22 @@ export function SettingsPanel({ onClose, onLogout, perf }: Props) {
   const [fingerprintText, setFingerprintText] = useState('')
   const [bench, setBench] = useState<Record<string, number> | null>(null)
   const [benchRunning, setBenchRunning] = useState(false)
+  const [devices_, setMediaDevices] = useState({ audio: false, video: false })
+  const [notifOn, setNotifOn] = useState(notificationsAllowed())
 
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
-        const [list, fp] = await Promise.all([
+        const [list, fp, media] = await Promise.all([
           engine.devices(),
           engine.session ? fingerprint(engine.session.profile.public_key) : Promise.resolve(''),
+          checkDevices(),
         ])
         if (cancelled) return
         setDevices(list)
         setFingerprintText(fp)
+        setMediaDevices(media)
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -118,6 +126,74 @@ export function SettingsPanel({ onClose, onLogout, perf }: Props) {
           )}
         </section>
 
+        {/* Звонки */}
+        <section className="mb-5">
+          <h3 className="mb-2 flex items-center gap-1.5 text-xs uppercase tracking-wide text-mist-400">
+            <PhoneCall size={13} /> Звонки
+          </h3>
+          <div className="space-y-2 rounded-xl bg-ink-800 p-3 text-xs">
+            <StatusRow
+              ok={rtcSupported()}
+              label="WebRTC доступен"
+              note={rtcSupported() ? 'HTTPS и браузер поддерживают звонки' : 'Нужен HTTPS: откройте сайт по защищённому адресу'}
+            />
+            <StatusRow
+              ok={devices_.audio}
+              label="Микрофон"
+              note={devices_.audio ? 'найден' : 'не обнаружен — говорить не получится'}
+            />
+            <StatusRow
+              ok={devices_.video}
+              label="Камера"
+              note={devices_.video ? 'найдена' : 'не обнаружена — видеозвонок будет только голосовым'}
+            />
+            <StatusRow
+              ok={hasTurn()}
+              label="TURN-сервер"
+              note={
+                hasTurn()
+                  ? 'настроен — звонки пройдут через любые сети'
+                  : 'не настроен: между мобильным интернетом и Wi-Fi звонок может не соединиться'
+              }
+              warn={!hasTurn()}
+            />
+            <p className="pt-1 text-[0.6875rem] leading-relaxed text-mist-400">
+              Медиа идёт напрямую между участниками и шифруется DTLS-SRTP — встроенным
+              шифрованием WebRTC. Сервер в разговоре не участвует.
+            </p>
+          </div>
+        </section>
+
+        {/* Уведомления */}
+        <section className="mb-5">
+          <h3 className="mb-2 flex items-center gap-1.5 text-xs uppercase tracking-wide text-mist-400">
+            <Bell size={13} /> Уведомления
+          </h3>
+          <div className="flex items-center gap-3 rounded-xl bg-ink-800 p-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm text-white">
+                {notifOn ? 'Включены' : 'Выключены'}
+              </p>
+              <p className="text-[0.6875rem] text-mist-400">
+                {notifOn
+                  ? 'Показываются только когда окно неактивно или открыт другой чат'
+                  : 'Разрешите, чтобы не пропускать сообщения при свёрнутом окне'}
+              </p>
+            </div>
+            {!notifOn && (
+              <button
+                onClick={async () => {
+                  const ok = await requestNotificationPermission()
+                  setNotifOn(ok)
+                }}
+                className="shrink-0 rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white transition-transform hover:scale-[1.03] active:scale-[0.97]"
+              >
+                Разрешить
+              </button>
+            )}
+          </div>
+        </section>
+
         {/* Отпечаток ключа */}
         {fingerprintText && (
           <section className="mb-5">
@@ -184,6 +260,31 @@ function Metric({ label, value }: { label: string; value: string }) {
     <div className="rounded-xl bg-ink-800 px-3 py-2.5">
       <p className="text-[0.6875rem] text-mist-400">{label}</p>
       <p className="font-mono text-sm text-white">{value}</p>
+    </div>
+  )
+}
+
+/** Строка состояния возможности: галочка или предупреждение, без «тишины». */
+function StatusRow({
+  ok,
+  label,
+  note,
+  warn,
+}: {
+  ok: boolean
+  label: string
+  note: string
+  warn?: boolean
+}) {
+  const color = ok ? 'text-emerald-400' : warn ? 'text-amber-400' : 'text-red-400'
+  const mark = ok ? '✓' : warn ? '!' : '✕'
+  return (
+    <div className="flex items-start gap-2">
+      <span className={`mt-0.5 font-mono text-xs ${color}`}>{mark}</span>
+      <div className="min-w-0 flex-1">
+        <p className="text-mist-200">{label}</p>
+        <p className="text-[0.6875rem] leading-relaxed text-mist-400">{note}</p>
+      </div>
     </div>
   )
 }

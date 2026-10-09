@@ -1,13 +1,25 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, MessageSquare, ShieldCheck } from 'lucide-react'
 import { engine, type EngineSession } from '@/lib/engine'
 import { isConfigured } from '@/lib/api'
+import { calls } from '@/lib/rtc'
+import {
+  isWindowActive,
+  notifyMessage,
+  playTone,
+  requestNotificationPermission,
+  resetTitle,
+  setUnreadTitle,
+  unlockAudio,
+} from '@/lib/notify'
 import { useChats } from '@/hooks/useChats'
 import { useRefreshProfile } from '@/hooks/useRefreshProfile'
 import { AuthView } from '@/components/AuthView'
 import { ChatView } from '@/components/ChatView'
 import { Sidebar } from '@/components/Sidebar'
 import { SettingsPanel } from '@/components/SettingsPanel'
+import { GroupPanel } from '@/components/GroupPanel'
+import { CallOverlay } from '@/components/CallOverlay'
 import { ConnectionWarning } from '@/components/ConnectionWarning'
 import type { Chat, Profile } from '@/lib/types'
 
@@ -19,8 +31,13 @@ export default function App() {
   const [activeChat, setActiveChat] = useState<Chat | null>(null)
   const [activePeer, setActivePeer] = useState<Profile | undefined>()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [groupOpen, setGroupOpen] = useState(false)
+  const [callOpen, setCallOpen] = useState(false)
   const [mobilePane, setMobilePane] = useState<'list' | 'chat'>('list')
   const perf = useRefreshProfile()
+
+  const activeChatRef = useRef<Chat | null>(null)
+  activeChatRef.current = activeChat
 
   const { chats, peers, members, lastMessage, loading, addChat } = useChats(
     phase === 'ready',
@@ -53,6 +70,91 @@ export default function App() {
     }
   }, [])
 
+  // Звонок начался или пришёл — открываем экран звонка.
+  useEffect(() => {
+    const off = calls.on((e) => {
+      if (e.type === 'state' && e.state !== 'idle' && e.state !== 'ended') setCallOpen(true)
+      if (e.type === 'incoming') {
+        playTone('call')
+        setCallOpen(true)
+      }
+    })
+    return off
+  }, [])
+
+  /**
+   * Уведомления и звук.
+   *
+   * Правило простое: сигналим только о том, чего человек не видит. Если окно
+   * активно и открыт именно этот чат — ни звука, ни всплывающего окна, ни
+   * счётчика: сообщение уже перед глазами.
+   */
+  useEffect(() => {
+    if (phase !== 'ready') return
+
+    const off = engine.on((e) => {
+      if (e.type !== 'message') return
+      if (e.message.sender_id === session?.userId) return
+
+      const chatId = e.chatId
+      const isOpen = activeChatRef.current?.id === chatId && isWindowActive()
+      if (isOpen) return
+
+      playTone('message')
+
+      const title = chats.find((c) => c.id === chatId)?.title ?? peers.get(chatId)?.display_name
+      notifyMessage({
+        title: title ?? 'Новое сообщение',
+        body: e.message.kind === 'file' ? '📎 Прислан файл' : e.message.text.slice(0, 120),
+        active: false,
+        tag: chatId,
+        onClick: () => {
+          const chat = chats.find((c) => c.id === chatId)
+          if (chat) {
+            setActiveChat(chat)
+            setActivePeer(peers.get(chatId))
+            setMobilePane('chat')
+          }
+        },
+      })
+
+      // Счётчик в заголовке вкладки: (3) Aurora — ...
+      const total = chats.reduce((sum, c) => sum + engine.unreadCount(c.id), 0)
+      setUnreadTitle(total + 1)
+    })
+    return off
+  }, [phase, session?.userId, chats, peers])
+
+  // Сбрасываем заголовок, когда окно снова стало активным.
+  useEffect(() => {
+    const onFocus = () => {
+      if (isWindowActive()) resetTitle()
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
+  }, [])
+
+  // Звук в браузере разрешён только после действия пользователя —
+  // используем первое касание, чтобы сигнал работал сразу.
+  useEffect(() => {
+    const once = () => {
+      unlockAudio()
+      if (phase === 'ready') void requestNotificationPermission()
+      window.removeEventListener('pointerdown', once)
+      window.removeEventListener('keydown', once)
+    }
+    window.addEventListener('pointerdown', once)
+    window.addEventListener('keydown', once)
+    return () => {
+      window.removeEventListener('pointerdown', once)
+      window.removeEventListener('keydown', once)
+    }
+  }, [phase])
+
   const onAuthed = useCallback(() => {
     setSession(engine.session)
     setPhase('ready')
@@ -60,10 +162,12 @@ export default function App() {
 
   const logout = useCallback(async () => {
     setSettingsOpen(false)
+    await calls.hangup()
     await engine.logout()
     setSession(null)
     setActiveChat(null)
     setActivePeer(undefined)
+    resetTitle()
     setPhase('auth')
   }, [])
 
@@ -71,6 +175,7 @@ export default function App() {
     setActiveChat(chat)
     setActivePeer(peer)
     setMobilePane('chat')
+    resetTitle()
   }, [])
 
   const onCreated = useCallback(
@@ -120,7 +225,6 @@ export default function App() {
           onSelect={selectChat}
           onCreated={onCreated}
           onOpenSettings={() => setSettingsOpen(true)}
-          onClose={mobilePane === 'chat' ? undefined : undefined}
         />
       </div>
 
@@ -132,15 +236,36 @@ export default function App() {
             members={activeMembers}
             selfId={session!.userId}
             onBack={() => setMobilePane('list')}
+            onOpenGroup={() => setGroupOpen(true)}
           />
         ) : (
           <EmptyState />
         )}
       </div>
 
-      {settingsOpen && (
-        <SettingsPanel onClose={() => setSettingsOpen(false)} onLogout={() => void logout()} perf={perf} />
+      {groupOpen && activeChat && (
+        <GroupPanel
+          chat={activeChat}
+          selfId={session!.userId}
+          onClose={() => setGroupOpen(false)}
+          onLeft={() => {
+            setGroupOpen(false)
+            setActiveChat(null)
+            setActivePeer(undefined)
+            setMobilePane('list')
+          }}
+        />
       )}
+
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          onLogout={() => void logout()}
+          perf={perf}
+        />
+      )}
+
+      {callOpen && <CallOverlay onClose={() => setCallOpen(false)} />}
     </div>
   )
 }
@@ -165,7 +290,7 @@ function EmptyState() {
           сервер видит только шифротекст.
         </p>
         <p className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-aqua-500/10 px-3 py-1.5 text-xs text-aqua-400">
-          <ShieldCheck size={12} /> AES-256-GCM · ECDH P-256
+          <ShieldCheck size={12} /> AES-256-GCM · ECDH P-256 · WebRTC
         </p>
       </div>
     </div>

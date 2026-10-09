@@ -10,7 +10,27 @@ import type { Chat, ChatMember, Device, Message, Profile, Receipt } from './type
 const url = import.meta.env.VITE_SUPABASE_URL
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
-export const isConfigured = Boolean(url && anonKey && url.startsWith('http'))
+/**
+ * Есть ли настоящее подключение к бэкенду.
+ *
+ * Проверяются не только формат, но и заглушки из .env.example: адрес вида
+ * «xxxxxxxxxxxx» и ключ не в формате JWT. Без этого приложение считало бы
+ * пример настоящими настройками, показывало форму входа — и человек
+ * упирался бы в непонятную ошибку входа вместо внятной подсказки.
+ */
+export const isConfigured = (() => {
+  if (!url || !anonKey) return false
+  if (!url.startsWith('https://')) return false
+
+  const host = url.replace(/^https:\/\//, '').replace(/\.supabase\.co.*$/, '')
+  if (/^x+$/i.test(host)) return false
+  if (/^(ваш|your|example|test|demo|placeholder)$/i.test(host)) return false
+
+  // Ключ Supabase — это JWT: всегда начинается с eyJ.
+  if (!anonKey.startsWith('eyJ')) return false
+
+  return true
+})()
 
 export let supabase: SupabaseClient = createClient(
   url || 'https://placeholder.supabase.co',
@@ -123,16 +143,76 @@ export async function touchLastSeen(userId: string) {
 // ─────────────────────────── устройства ───────────────────────────
 
 export async function registerDevice(userId: string, label: string): Promise<Device> {
+  // Устройство опознаём по отпечатку браузера, а не создаём новую запись
+  // при каждом входе: иначе список устройств превращается в мусор.
+  const fingerprint = deviceFingerprint()
+  const existing = await supabase
+    .from('devices')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('label', label)
+    .maybeSingle()
+
+  if (existing.data) {
+    const { data, error } = await supabase
+      .from('devices')
+      .update({ last_active: new Date().toISOString(), user_agent: fingerprint })
+      .eq('id', existing.data.id)
+      .select()
+      .single()
+    if (error) throw error
+    return data as Device
+  }
+
   const { data, error } = await supabase
     .from('devices')
-    .upsert(
-      { user_id: userId, label, user_agent: navigator.userAgent.slice(0, 250), last_active: new Date().toISOString() },
-      { onConflict: 'id' },
-    )
+    .insert({ user_id: userId, label, user_agent: fingerprint, last_active: new Date().toISOString() })
     .select()
     .single()
   if (error) throw error
   return data as Device
+}
+
+/** Человекочитаемое имя устройства: «Chrome на Windows» понятнее, чем UA-строка. */
+export function deviceLabel(): string {
+  const ua = navigator.userAgent
+  const browser = /Edg\//.test(ua)
+    ? 'Edge'
+    : /OPR\//.test(ua)
+      ? 'Opera'
+      : /YaBrowser\//.test(ua)
+        ? 'Яндекс'
+        : /Firefox\//.test(ua)
+          ? 'Firefox'
+          : /Chrome\//.test(ua)
+            ? 'Chrome'
+            : /Safari\//.test(ua)
+              ? 'Safari'
+              : 'Браузер'
+  const os = /Windows/.test(ua)
+    ? 'Windows'
+    : /Android/.test(ua)
+      ? 'Android'
+      : /iPhone|iPad/.test(ua)
+        ? 'iOS'
+        : /Mac OS/.test(ua)
+          ? 'macOS'
+          : /Linux/.test(ua)
+            ? 'Linux'
+            : 'система'
+  return `${browser} на ${os}`
+}
+
+function deviceFingerprint(): string {
+  return [
+    navigator.userAgent,
+    navigator.language,
+    screen.width,
+    screen.height,
+    new Date().getTimezoneOffset(),
+  ]
+    .join('|')
+    .slice(0, 250)
 }
 
 export async function listDevices(userId: string): Promise<Device[]> {
@@ -193,6 +273,44 @@ export async function getMembers(chatIds: string[]): Promise<ChatMember[]> {
   return (data ?? []) as ChatMember[]
 }
 
+export async function removeMember(chatId: string, userId: string) {
+  const { error } = await supabase
+    .from('chat_members')
+    .delete()
+    .eq('chat_id', chatId)
+    .eq('user_id', userId)
+  if (error) throw error
+}
+
+/**
+ * Отметка присутствия.
+ * Живёт в таблице devices: отдельная таблица ради одной отметки времени
+ * была бы лишней сущностью.
+ */
+export async function heartbeat(deviceId: string) {
+  await supabase.from('devices').update({ last_active: new Date().toISOString() }).eq('id', deviceId)
+}
+
+/** Подписка на присутствие участников: кто сейчас в сети. */
+export function presenceChannel(userId: string, onSync: (online: string[]) => void) {
+  const channel = supabase.channel('presence:global', {
+    config: { presence: { key: userId } },
+  })
+
+  channel
+    .on('presence', { event: 'sync' }, () => {
+      const state = channel.presenceState()
+      onSync(Object.keys(state))
+    })
+    .subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.track({ online_at: new Date().toISOString() })
+      }
+    })
+
+  return channel
+}
+
 export async function updateChatTitle(chatId: string, title: string) {
   const { error } = await supabase.from('chats').update({ title }).eq('id', chatId)
   if (error) throw error
@@ -234,6 +352,33 @@ export async function fetchMessages(chatId: string, limit = 200): Promise<Messag
 export async function deleteMessage(id: string) {
   const { error } = await supabase.from('messages').delete().eq('id', id)
   if (error) throw error
+}
+
+/** Реакции: одна реакция на пользователя на сообщение. */
+export async function addReaction(messageId: string, userId: string, emoji: string) {
+  const { error } = await supabase
+    .from('reactions')
+    .upsert({ message_id: messageId, user_id: userId, emoji }, { onConflict: 'message_id,user_id' })
+  if (error) throw error
+}
+
+export async function removeReaction(messageId: string, userId: string) {
+  const { error } = await supabase
+    .from('reactions')
+    .delete()
+    .eq('message_id', messageId)
+    .eq('user_id', userId)
+  if (error) throw error
+}
+
+export async function fetchReactions(messageIds: string[]) {
+  if (!messageIds.length) return []
+  const { data, error } = await supabase
+    .from('reactions')
+    .select('message_id,user_id,emoji')
+    .in('message_id', messageIds)
+  if (error) throw error
+  return (data ?? []) as { message_id: string; user_id: string; emoji: string }[]
 }
 
 // ─────────────────────────── доставлено / прочитано ───────────────────────────

@@ -9,9 +9,10 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --port 4173",
     "bench": "node bench/run.mjs",
+    "bench:rtc": "node bench/rtc.mjs",
     "bench:browser": "vite build --config vite.bench.config.ts && node bench/browser.mjs",
     "bench:smoke": "npm run build && node bench/smoke.mjs",
-    "bench:all": "npm run bench && npm run bench:browser && npm run bench:smoke"
+    "bench:all": "npm run bench && npm run bench:rtc && npm run bench:browser && npm run bench:smoke"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
