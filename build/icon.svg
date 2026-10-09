@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#00d6bd"/>
+    </linearGradient>
+    <linearGradient id="letter" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e8e4ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+  <!-- Стилизованная A: два луча и перемычка, как созвездие -->
+  <path d="M128 52 L188 204 L156 204 L128 124 L100 204 L68 204 Z"
+        fill="url(#letter)"/>
+  <rect x="103" y="150" width="50" height="16" rx="8" fill="#08080c" opacity="0.25"/>
+</svg>

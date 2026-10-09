@@ -3,19 +3,25 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Aurora — быстрый защищённый мессенджер с E2E-шифрованием, работает из любой сети",
+  "description": "Aurora — защищённый мессенджер со сквозным шифрованием. Свой сервер, своя база, никаких внешних сервисов",
+  "main": "electron/main.mjs",
   "scripts": {
+    "start": "node server/index.mjs",
+    "app": "electron .",
+    "dist": "npm run build && electron-builder --win",
     "dev": "vite",
+    "dev:server": "node server/index.mjs",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --port 4173",
+    "launch": "powershell -ExecutionPolicy Bypass -File start.ps1",
     "bench": "node bench/run.mjs",
     "bench:rtc": "node bench/rtc.mjs",
+    "bench:server": "node bench/server.mjs",
     "bench:browser": "vite build --config vite.bench.config.ts && node bench/browser.mjs",
-    "bench:smoke": "npm run build && node bench/smoke.mjs",
-    "bench:all": "npm run bench && npm run bench:rtc && npm run bench:browser && npm run bench:smoke"
+    "bench:e2e": "npm run build && node bench/e2e.mjs",
+    "bench:exe": "node bench/exe.mjs",
+    "bench:all": "npm run bench && npm run bench:rtc && npm run bench:server && npm run bench:browser && npm run build && node bench/e2e.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
     "idb": "^8.0.0",
     "lucide-react": "^0.454.0",
     "react": "^18.3.1",
@@ -27,11 +33,54 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.6.3",
     "vite": "^6.0.0"
   },
   "allowScripts": {
-    "esbuild@0.25.12": true
+    "esbuild@0.25.12": true,
+    "electron@44.7.0": true
+  },
+  "build": {
+    "appId": "app.aurora.messenger",
+    "productName": "Aurora",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "dist/**",
+      "server/**"
+    ],
+    "win": {
+      "icon": "build/icons/win/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "artifactName": "Aurora-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Aurora-Portable.${ext}"
+    }
   }
 }

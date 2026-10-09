@@ -1,177 +1,231 @@
 /**
- * Клиент Supabase и весь доступ к данным.
+ * Клиент API автономного сервера.
  *
- * Правило слоя: сюда приходит только шифротекст. Ни одна функция этого модуля
- * не знает, что внутри сообщения.
+ * Заменяет собой облачный слой: тот же набор операций, но запросы идут на
+ * свой сервер, который поднимается вместе с приложением. Ни регистраций на
+ * сторонних сайтах, ни ключей, ни интернета — всё работает локально.
+ *
+ * Правило слоя остаётся прежним: сюда приходит только шифротекст. Ни одна
+ * функция этого модуля не знает, что внутри сообщения.
+ *
+ * Обмен событиями — один поток на клиента (Server-Sent Events), а не канал
+ * на каждый чат: меньше соединений, меньше кода и автоматическое
+ * переподключение средствами браузера.
  */
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
-import type { Chat, ChatMember, Device, Message, Profile, Receipt } from './types'
-
-const url = import.meta.env.VITE_SUPABASE_URL
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+import type {
+  Chat,
+  ChatMember,
+  Device,
+  Message,
+  Profile,
+  Receipt,
+} from './types'
 
 /**
- * Есть ли настоящее подключение к бэкенду.
+ * Адрес сервера.
  *
- * Проверяются не только формат, но и заглушки из .env.example: адрес вида
- * «xxxxxxxxxxxx» и ключ не в формате JWT. Без этого приложение считало бы
- * пример настоящими настройками, показывало форму входа — и человек
- * упирался бы в непонятную ошибку входа вместо внятной подсказки.
+ * В обычной работе клиент и сервер живут на одном порту, поэтому путь
+ * относительный. Переменная нужна только для раздельной разработки,
+ * когда Vite отдаёт страницу на 5173, а API слушает 8787.
  */
-export const isConfigured = (() => {
-  if (!url || !anonKey) return false
-  if (!url.startsWith('https://')) return false
+const API_BASE = import.meta.env.VITE_API_URL || ''
 
-  const host = url.replace(/^https:\/\//, '').replace(/\.supabase\.co.*$/, '')
-  if (/^x+$/i.test(host)) return false
-  if (/^(ваш|your|example|test|demo|placeholder)$/i.test(host)) return false
+const TOKEN_KEY = 'aurora.token'
 
-  // Ключ Supabase — это JWT: всегда начинается с eyJ.
-  if (!anonKey.startsWith('eyJ')) return false
+let token: string | null = null
 
-  return true
-})()
+// ─────────────────────────── токен сессии ───────────────────────────
 
-export let supabase: SupabaseClient = createClient(
-  url || 'https://placeholder.supabase.co',
-  anonKey || 'placeholder',
-  {
-    auth: {
-      persistSession: true,
-      autoRefreshToken: true,
-      // Ключевое для «запоминания устройства»: сессия переживает закрытие браузера.
-      storage: typeof window !== 'undefined' ? window.localStorage : undefined,
-      storageKey: 'aurora.auth',
-      detectSessionInUrl: true,
-      flowType: 'pkce',
-    },
-    realtime: {
-      params: { eventsPerSecond: 40 },
-    },
-    global: {
-      headers: { 'x-application-name': 'aurora-messenger' },
-    },
-  },
-)
-
-export function reinitClient() {
-  supabase = createClient(url || 'https://placeholder.supabase.co', anonKey || 'placeholder')
+function loadToken(): string | null {
+  if (token !== null) return token
+  try {
+    token = localStorage.getItem(TOKEN_KEY)
+  } catch {
+    token = null
+  }
+  return token
 }
 
-// ─────────────────────────── авторизация ───────────────────────────
-
-export async function signUp(email: string, password: string) {
-  const { data, error } = await supabase.auth.signUp({
-    email,
-    password,
-    options: { emailRedirectTo: `${location.origin}${import.meta.env.BASE_URL}` },
-  })
-  if (error) throw error
-  return data
+function saveToken(value: string | null) {
+  token = value
+  try {
+    if (value) localStorage.setItem(TOKEN_KEY, value)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    /* приватный режим может запрещать localStorage */
+  }
 }
 
-export async function signIn(email: string, password: string) {
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-  if (error) throw error
-  return data
+export function authToken(): string | null {
+  return loadToken()
 }
 
-export async function signOut() {
-  await supabase.auth.signOut()
+// ─────────────────────────── запросы ───────────────────────────
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
 }
 
-export async function currentSession() {
-  const { data } = await supabase.auth.getSession()
-  return data.session
+async function request<T>(
+  method: string,
+  path: string,
+  options: { body?: unknown; raw?: BodyInit; headers?: Record<string, string> } = {},
+): Promise<T> {
+  const headers: Record<string, string> = { ...options.headers }
+  const current = loadToken()
+  if (current) headers.Authorization = `Bearer ${current}`
+
+  let body: BodyInit | undefined
+  if (options.raw !== undefined) {
+    body = options.raw
+  } else if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json'
+    body = JSON.stringify(options.body)
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${API_BASE}${path}`, { method, headers, body })
+  } catch (e) {
+    // Сеть отвалилась или сервер не запущен — это самая частая проблема,
+    // и сообщение должно объяснять причину, а не показывать «Failed to fetch».
+    throw new ApiError(
+      'Нет связи с сервером Aurora. Проверьте, что он запущен, и обновите страницу.',
+      0,
+      'OFFLINE',
+    )
+  }
+
+  if (res.status === 204) return undefined as T
+
+  const text = await res.text()
+  let data: unknown = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = null
+    }
+  }
+
+  if (!res.ok) {
+    const payload = data as { error?: string; code?: string } | null
+    if (res.status === 401) saveToken(null)
+    throw new ApiError(payload?.error ?? `Ошибка ${res.status}`, res.status, payload?.code)
+  }
+
+  return data as T
 }
 
-// ─────────────────────────── профили ───────────────────────────
+const get = <T>(path: string) => request<T>('GET', path)
+const post = <T>(path: string, body?: unknown) => request<T>('POST', path, { body })
+const patch = <T>(path: string, body?: unknown) => request<T>('PATCH', path, { body })
+const del = <T>(path: string) => request<T>('DELETE', path)
 
-export async function getProfile(userId: string): Promise<Profile | null> {
-  const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle()
-  if (error) throw error
-  return data as Profile | null
+// ─────────────────────────── служебное ───────────────────────────
+
+export interface HealthInfo {
+  ok: boolean
+  name: string
+  version: string
+  time: string
+  capabilities: { calls: boolean; files: boolean; groups: boolean; e2e: boolean }
 }
 
-export async function getProfilesByIds(ids: string[]): Promise<Profile[]> {
-  if (!ids.length) return []
-  const { data, error } = await supabase.from('profiles').select('*').in('id', ids)
-  if (error) throw error
-  return (data ?? []) as Profile[]
+/** Проверка: поднят ли сервер. Нужна экрану входа и замерам скорости. */
+export async function health(): Promise<HealthInfo> {
+  return get<HealthInfo>('/api/health')
 }
 
-export async function createProfile(p: {
-  id: string
+export async function measureRtt(): Promise<number> {
+  const t0 = performance.now()
+  await health()
+  return performance.now() - t0
+}
+
+// ─────────────────────────── вход и регистрация ───────────────────────────
+
+export interface AuthResult {
+  user: { id: string; email: string }
+  token: string
+  profile: Profile
+}
+
+export async function register(params: {
+  email: string
+  password: string
   username: string
   display_name: string
   public_key: string
   wrapped_private: string
   kdf_salt: string
   kdf_iterations: number
-}) {
-  const { error } = await supabase.from('profiles').upsert(p)
-  if (error) throw error
+}): Promise<AuthResult> {
+  const result = await post<AuthResult>('/api/auth/register', params)
+  saveToken(result.token)
+  return result
 }
 
-export async function findProfileByUsername(username: string): Promise<Profile | null> {
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .ilike('username', username)
-    .maybeSingle()
-  if (error) throw error
-  return data as Profile | null
+export async function login(email: string, password: string): Promise<AuthResult> {
+  const result = await post<AuthResult>('/api/auth/login', { email, password })
+  saveToken(result.token)
+  return result
 }
 
-export async function searchProfiles(query: string, excludeId: string): Promise<Profile[]> {
+export async function logout(): Promise<void> {
+  try {
+    await post('/api/auth/logout')
+  } finally {
+    // Локальный токен убираем даже если запрос не прошёл: иначе человек
+    // останется «внутри» с недействительной сессией.
+    saveToken(null)
+  }
+}
+
+export async function currentSession(): Promise<{ user: { id: string; email: string }; profile: Profile } | null> {
+  if (!loadToken()) return null
+  try {
+    return await get<{ user: { id: string; email: string }; profile: Profile }>('/api/auth/session')
+  } catch {
+    return null
+  }
+}
+
+// ─────────────────────────── профили ───────────────────────────
+
+export async function getProfile(userId: string): Promise<Profile | null> {
+  try {
+    return await get<Profile>(`/api/profiles/${encodeURIComponent(userId)}`)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null
+    throw e
+  }
+}
+
+export async function getProfilesByIds(ids: string[]): Promise<Profile[]> {
+  if (!ids.length) return []
+  return post<Profile[]>('/api/profiles/by-ids', { ids })
+}
+
+export async function searchProfiles(query: string, _excludeId?: string): Promise<Profile[]> {
   const q = query.trim()
   if (q.length < 2) return []
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .ilike('username', `%${q}%`)
-    .neq('id', excludeId)
-    .limit(20)
-  if (error) throw error
-  return (data ?? []) as Profile[]
+  return get<Profile[]>(`/api/profiles/search/${encodeURIComponent(q)}`)
 }
 
-export async function touchLastSeen(userId: string) {
-  await supabase.from('profiles').update({ last_seen: new Date().toISOString() }).eq('id', userId)
+export async function touchLastSeen(_userId: string): Promise<void> {
+  // Отметка присутствия ставится сервером при обращении к потоку событий,
+  // отдельный запрос для этого не нужен.
 }
 
 // ─────────────────────────── устройства ───────────────────────────
-
-export async function registerDevice(userId: string, label: string): Promise<Device> {
-  // Устройство опознаём по отпечатку браузера, а не создаём новую запись
-  // при каждом входе: иначе список устройств превращается в мусор.
-  const fingerprint = deviceFingerprint()
-  const existing = await supabase
-    .from('devices')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('label', label)
-    .maybeSingle()
-
-  if (existing.data) {
-    const { data, error } = await supabase
-      .from('devices')
-      .update({ last_active: new Date().toISOString(), user_agent: fingerprint })
-      .eq('id', existing.data.id)
-      .select()
-      .single()
-    if (error) throw error
-    return data as Device
-  }
-
-  const { data, error } = await supabase
-    .from('devices')
-    .insert({ user_id: userId, label, user_agent: fingerprint, last_active: new Date().toISOString() })
-    .select()
-    .single()
-  if (error) throw error
-  return data as Device
-}
 
 /** Человекочитаемое имя устройства: «Chrome на Windows» понятнее, чем UA-строка. */
 export function deviceLabel(): string {
@@ -203,124 +257,83 @@ export function deviceLabel(): string {
   return `${browser} на ${os}`
 }
 
-function deviceFingerprint(): string {
-  return [
-    navigator.userAgent,
-    navigator.language,
-    screen.width,
-    screen.height,
-    new Date().getTimezoneOffset(),
-  ]
-    .join('|')
-    .slice(0, 250)
+export async function registerDevice(_userId: string, label: string): Promise<Device> {
+  return post<Device>('/api/devices', { label })
 }
 
-export async function listDevices(userId: string): Promise<Device[]> {
-  const { data, error } = await supabase
-    .from('devices')
-    .select('*')
-    .eq('user_id', userId)
-    .order('last_active', { ascending: false })
-  if (error) throw error
-  return (data ?? []) as Device[]
+export async function listDevices(_userId: string): Promise<Device[]> {
+  return get<Device[]>('/api/devices')
 }
 
-export async function removeDevice(id: string) {
-  const { error } = await supabase.from('devices').delete().eq('id', id)
-  if (error) throw error
+export async function removeDevice(id: string): Promise<void> {
+  await del(`/api/devices/${encodeURIComponent(id)}`)
+}
+
+export async function heartbeat(deviceId: string): Promise<void> {
+  try {
+    await post(`/api/devices/${encodeURIComponent(deviceId)}/ping`)
+  } catch {
+    // Отметка присутствия — вспомогательная функция, сбой не должен
+    // выбрасывать человека из мессенджера.
+  }
 }
 
 // ─────────────────────────── чаты ───────────────────────────
 
-export async function createChat(kind: 'direct' | 'group', title: string | null, createdBy: string): Promise<Chat> {
-  const { data, error } = await supabase
-    .from('chats')
-    .insert({ kind, title, created_by: createdBy })
-    .select()
-    .single()
-  if (error) throw error
-  return data as Chat
+export async function createChat(
+  kind: 'direct' | 'group',
+  title: string | null,
+  _createdBy: string,
+  members: { user_id: string; wrapped_key: string }[],
+): Promise<Chat> {
+  return post<Chat>('/api/chats', { kind, title, members })
 }
 
-export async function addMembers(rows: { chat_id: string; user_id: string; wrapped_key: string }[]) {
-  const { error } = await supabase.from('chat_members').insert(rows)
-  if (error) throw error
-}
-
-/** Идемпотентно: RLS не даёт читать членов чужих чатов, поэтому делаем сразу с ключами. */
-export async function upsertMembers(rows: { chat_id: string; user_id: string; wrapped_key: string }[]) {
-  const { error } = await supabase.from('chat_members').upsert(rows, { onConflict: 'chat_id,user_id' })
-  if (error) throw error
-}
-
-export async function getMyMemberships(userId: string): Promise<ChatMember[]> {
-  const { data, error } = await supabase.from('chat_members').select('*').eq('user_id', userId)
-  if (error) throw error
-  return (data ?? []) as ChatMember[]
+export async function getMyMemberships(_userId: string): Promise<ChatMember[]> {
+  return get<ChatMember[]>('/api/memberships')
 }
 
 export async function getChatsByIds(ids: string[]): Promise<Chat[]> {
   if (!ids.length) return []
-  const { data, error } = await supabase.from('chats').select('*').in('id', ids)
-  if (error) throw error
-  return (data ?? []) as Chat[]
+  return post<Chat[]>('/api/chats/by-ids', { ids })
 }
 
 export async function getMembers(chatIds: string[]): Promise<ChatMember[]> {
   if (!chatIds.length) return []
-  const { data, error } = await supabase.from('chat_members').select('*').in('chat_id', chatIds)
-  if (error) throw error
-  return (data ?? []) as ChatMember[]
+  const results = await Promise.all(
+    chatIds.map((id) => get<ChatMember[]>(`/api/chats/${encodeURIComponent(id)}/members`)),
+  )
+  return results.flat()
 }
 
-export async function removeMember(chatId: string, userId: string) {
-  const { error } = await supabase
-    .from('chat_members')
-    .delete()
-    .eq('chat_id', chatId)
-    .eq('user_id', userId)
-  if (error) throw error
+export async function upsertMembers(
+  rows: { chat_id: string; user_id: string; wrapped_key: string }[],
+): Promise<void> {
+  // Группируем по чату: сервер принимает участников одного чата за раз.
+  const byChat = new Map<string, { user_id: string; wrapped_key: string }[]>()
+  for (const r of rows) {
+    const list = byChat.get(r.chat_id) ?? []
+    list.push({ user_id: r.user_id, wrapped_key: r.wrapped_key })
+    byChat.set(r.chat_id, list)
+  }
+  for (const [chatId, members] of byChat) {
+    await post(`/api/chats/${encodeURIComponent(chatId)}/members`, { members })
+  }
 }
 
-/**
- * Отметка присутствия.
- * Живёт в таблице devices: отдельная таблица ради одной отметки времени
- * была бы лишней сущностью.
- */
-export async function heartbeat(deviceId: string) {
-  await supabase.from('devices').update({ last_active: new Date().toISOString() }).eq('id', deviceId)
+export async function removeMember(chatId: string, userId: string): Promise<void> {
+  await del(`/api/chats/${encodeURIComponent(chatId)}/members/${encodeURIComponent(userId)}`)
 }
 
-/** Подписка на присутствие участников: кто сейчас в сети. */
-export function presenceChannel(userId: string, onSync: (online: string[]) => void) {
-  const channel = supabase.channel('presence:global', {
-    config: { presence: { key: userId } },
-  })
-
-  channel
-    .on('presence', { event: 'sync' }, () => {
-      const state = channel.presenceState()
-      onSync(Object.keys(state))
-    })
-    .subscribe(async (status) => {
-      if (status === 'SUBSCRIBED') {
-        await channel.track({ online_at: new Date().toISOString() })
-      }
-    })
-
-  return channel
-}
-
-export async function updateChatTitle(chatId: string, title: string) {
-  const { error } = await supabase.from('chats').update({ title }).eq('id', chatId)
-  if (error) throw error
+export async function updateChatTitle(chatId: string, title: string): Promise<void> {
+  await patch(`/api/chats/${encodeURIComponent(chatId)}`, { title })
 }
 
 // ─────────────────────────── сообщения ───────────────────────────
 
 export interface NewMessage {
   chat_id: string
-  sender_id: string
+  sender_id?: string
   ciphertext: string
   iv: string
   kind?: 'text' | 'file'
@@ -333,133 +346,275 @@ export interface NewMessage {
 }
 
 export async function sendMessage(m: NewMessage): Promise<Message> {
-  const { data, error } = await supabase.from('messages').insert(m).select().single()
-  if (error) throw error
-  return data as Message
+  return post<Message>('/api/messages', m)
 }
 
-export async function fetchMessages(chatId: string, limit = 200): Promise<Message[]> {
-  const { data, error } = await supabase
-    .from('messages')
-    .select('*')
-    .eq('chat_id', chatId)
-    .order('created_at', { ascending: true })
-    .limit(limit)
-  if (error) throw error
-  return (data ?? []) as Message[]
+export async function fetchMessages(chatId: string, limit = 300): Promise<Message[]> {
+  return get<Message[]>(`/api/chats/${encodeURIComponent(chatId)}/messages?limit=${limit}`)
 }
 
-export async function deleteMessage(id: string) {
-  const { error } = await supabase.from('messages').delete().eq('id', id)
-  if (error) throw error
+export async function editMessage(
+  id: string,
+  ciphertext: string,
+  iv: string,
+): Promise<Message> {
+  return patch<Message>(`/api/messages/${encodeURIComponent(id)}`, { ciphertext, iv })
 }
 
-/** Реакции: одна реакция на пользователя на сообщение. */
-export async function addReaction(messageId: string, userId: string, emoji: string) {
-  const { error } = await supabase
-    .from('reactions')
-    .upsert({ message_id: messageId, user_id: userId, emoji }, { onConflict: 'message_id,user_id' })
-  if (error) throw error
-}
-
-export async function removeReaction(messageId: string, userId: string) {
-  const { error } = await supabase
-    .from('reactions')
-    .delete()
-    .eq('message_id', messageId)
-    .eq('user_id', userId)
-  if (error) throw error
-}
-
-export async function fetchReactions(messageIds: string[]) {
-  if (!messageIds.length) return []
-  const { data, error } = await supabase
-    .from('reactions')
-    .select('message_id,user_id,emoji')
-    .in('message_id', messageIds)
-  if (error) throw error
-  return (data ?? []) as { message_id: string; user_id: string; emoji: string }[]
+export async function deleteMessage(id: string): Promise<void> {
+  await del(`/api/messages/${encodeURIComponent(id)}`)
 }
 
 // ─────────────────────────── доставлено / прочитано ───────────────────────────
 
-export async function markDelivered(messageIds: string[], userId: string) {
+export async function markDelivered(messageIds: string[], _userId: string): Promise<void> {
   if (!messageIds.length) return
-  const now = new Date().toISOString()
-  const rows = messageIds.map((id) => ({ message_id: id, user_id: userId, delivered_at: now }))
-  await supabase.from('receipts').upsert(rows, { onConflict: 'message_id,user_id' })
+  await post('/api/receipts', { message_ids: messageIds, read: false })
 }
 
-export async function markRead(messageIds: string[], userId: string) {
+export async function markRead(messageIds: string[], _userId: string): Promise<void> {
   if (!messageIds.length) return
-  const now = new Date().toISOString()
-  const rows = messageIds.map((id) => ({
-    message_id: id,
-    user_id: userId,
-    delivered_at: now,
-    read_at: now,
-  }))
-  await supabase.from('receipts').upsert(rows, { onConflict: 'message_id,user_id' })
+  await post('/api/receipts', { message_ids: messageIds, read: true })
 }
 
 export async function fetchReceipts(messageIds: string[]): Promise<Receipt[]> {
   if (!messageIds.length) return []
-  const { data, error } = await supabase.from('receipts').select('*').in('message_id', messageIds)
-  if (error) throw error
-  return (data ?? []) as Receipt[]
+  return post<Receipt[]>('/api/receipts/for', { message_ids: messageIds })
 }
 
-// ─────────────────────────── печатает ───────────────────────────
+// ─────────────────────────── «печатает» ───────────────────────────
 
-export async function setTyping(chatId: string, userId: string) {
-  await supabase.from('typing').upsert(
-    { chat_id: chatId, user_id: userId, updated_at: new Date().toISOString() },
-    { onConflict: 'chat_id,user_id' },
-  )
+export async function setTyping(chatId: string, _userId: string): Promise<void> {
+  await post('/api/typing', { chat_id: chatId, active: true })
 }
 
-export async function clearTyping(chatId: string, userId: string) {
-  await supabase.from('typing').delete().eq('chat_id', chatId).eq('user_id', userId)
+export async function clearTyping(chatId: string, _userId: string): Promise<void> {
+  await post('/api/typing', { chat_id: chatId, active: false })
 }
 
-export async function fetchTyping(chatId: string): Promise<{ user_id: string; updated_at: string }[]> {
-  const { data } = await supabase.from('typing').select('user_id, updated_at').eq('chat_id', chatId)
-  return data ?? []
+// ─────────────────────────── реакции ───────────────────────────
+
+export async function addReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
+  await post('/api/reactions', { message_id: messageId, emoji })
+}
+
+export async function removeReaction(messageId: string, _userId: string): Promise<void> {
+  await del(`/api/reactions/${encodeURIComponent(messageId)}`)
+}
+
+export async function fetchReactions(
+  messageIds: string[],
+): Promise<{ message_id: string; user_id: string; emoji: string }[]> {
+  if (!messageIds.length) return []
+  return post('/api/reactions/for', { message_ids: messageIds })
 }
 
 // ─────────────────────────── файлы ───────────────────────────
 
+/**
+ * Загрузка зашифрованного файла.
+ *
+ * Возвращает путь, назначенный сервером. Раньше путь придумывал клиент —
+ * теперь это делает сервер: так два человека не могут занять одно имя,
+ * и клиенту не нужно угадывать формат.
+ */
 export async function uploadEncrypted(
-  path: string,
+  chatId: string,
   blob: Blob,
   onProgress?: (ratio: number) => void,
-) {
-  // Прогресс через XHR недоступен в supabase-js, поэтому сообщаем о старте/финише
+): Promise<{ path: string; size: number }> {
   onProgress?.(0.05)
-  const { error } = await supabase.storage.from('encrypted').upload(path, blob, {
-    contentType: 'application/octet-stream',
-    cacheControl: '3600',
-    upsert: false,
-  })
-  if (error) throw error
+  const result = await request<{ path: string; size: number }>(
+    'POST',
+    `/api/files/${encodeURIComponent(chatId)}`,
+    {
+      raw: blob,
+      headers: { 'Content-Type': 'application/octet-stream' },
+    },
+  )
   onProgress?.(1)
+  return result
 }
 
 export async function downloadEncrypted(path: string): Promise<Blob> {
-  const { data, error } = await supabase.storage.from('encrypted').download(path)
-  if (error) throw error
-  return data
+  const headers: Record<string, string> = {}
+  const current = loadToken()
+  if (current) headers.Authorization = `Bearer ${current}`
+
+  const res = await fetch(`${API_BASE}/api/files/${path}`, { headers })
+  if (!res.ok) {
+    throw new ApiError('Не удалось получить файл', res.status)
+  }
+  return res.blob()
 }
 
-export async function removeEncrypted(path: string) {
-  await supabase.storage.from('encrypted').remove([path])
+export async function removeEncrypted(path: string): Promise<void> {
+  await del(`/api/files/${path}`)
 }
 
-// ─────────────────────────── счётчики производительности ───────────────────────────
+// ─────────────────────────── realtime ───────────────────────────
 
-/** Замер реального RTT до бэкенда — попадает в отчёт о скорости. */
-export async function measureRtt(): Promise<number> {
-  const t0 = performance.now()
-  await supabase.from('profiles').select('id', { count: 'exact', head: true }).limit(1)
-  return performance.now() - t0
+/** События, приходящие по потоку от сервера. */
+export interface ServerEvents {
+  onMessage?: (message: Message) => void
+  onMessageUpdated?: (message: Message) => void
+  onMessageDeleted?: (messageId: string, chatId: string) => void
+  onTyping?: (chatId: string, userId: string | null) => void
+  onReceipt?: (receipts: Receipt[]) => void
+  onReaction?: (messageId: string, userId: string, emoji: string | null) => void
+  onPresence?: (online: string[]) => void
+  onChat?: (chat: Chat) => void
+  onRemoved?: (chatId: string) => void
+  /** Служебные сообщения звонка — разбираются в rtc.ts. */
+  onCall?: (payload: unknown) => void
+  onStatus?: (connected: boolean) => void
+}
+
+let eventSource: EventSource | null = null
+let currentHandlers: ServerEvents = {}
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Открывает поток событий.
+ *
+ * Одно соединение на всё приложение: сообщения, реакции, отметки, typing,
+ * присутствие и сигнализация звонков идут по нему. Меньше соединений —
+ * меньше нагрузки и на сервер, и на браузер.
+ *
+ * Переподключение: браузер делает это сам, но если сервер перезапустили,
+ * соединение может закрыться окончательно. Поэтому на ошибку ставим свой
+ * таймер и открываем поток заново.
+ */
+export function subscribeEvents(handlers: ServerEvents, callChatId?: string | null): () => void {
+  currentHandlers = handlers
+  openEvents(callChatId)
+
+  return () => {
+    currentHandlers = {}
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+  }
+}
+
+/** Переподписка при входе в другой чат: комната звонков меняется. */
+export function resubscribeEvents(callChatId: string | null) {
+  if (!eventSource) return
+  openEvents(callChatId)
+}
+
+function openEvents(callChatId?: string | null) {
+  const current = loadToken()
+  if (!current) return
+
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+
+  const params = new URLSearchParams({ token: current })
+  if (callChatId) params.set('callChat', callChatId)
+
+  const source = new EventSource(`${API_BASE}/api/events?${params}`)
+  eventSource = source
+
+  source.onopen = () => currentHandlers.onStatus?.(true)
+
+  source.addEventListener('message', (e) => {
+    const data = JSON.parse((e as MessageEvent).data)
+    currentHandlers.onMessage?.(data.message)
+  })
+
+  source.addEventListener('message_updated', (e) => {
+    currentHandlers.onMessageUpdated?.(JSON.parse((e as MessageEvent).data).message)
+  })
+
+  source.addEventListener('message_deleted', (e) => {
+    const data = JSON.parse((e as MessageEvent).data)
+    currentHandlers.onMessageDeleted?.(data.messageId, data.chatId)
+  })
+
+  source.addEventListener('typing', (e) => {
+    const data = JSON.parse((e as MessageEvent).data)
+    currentHandlers.onTyping?.(data.chatId, data.userId)
+  })
+
+  source.addEventListener('receipt', (e) => {
+    currentHandlers.onReceipt?.(JSON.parse((e as MessageEvent).data).receipts)
+  })
+
+  source.addEventListener('reaction', (e) => {
+    const data = JSON.parse((e as MessageEvent).data)
+    currentHandlers.onReaction?.(data.messageId, data.userId, data.emoji)
+  })
+
+  source.addEventListener('presence', (e) => {
+    currentHandlers.onPresence?.(JSON.parse((e as MessageEvent).data).online)
+  })
+
+  source.addEventListener('chat', (e) => {
+    currentHandlers.onChat?.(JSON.parse((e as MessageEvent).data).chat)
+  })
+
+  source.addEventListener('removed', (e) => {
+    currentHandlers.onRemoved?.(JSON.parse((e as MessageEvent).data).chatId)
+  })
+
+  source.addEventListener('call', (e) => {
+    currentHandlers.onCall?.(JSON.parse((e as MessageEvent).data))
+  })
+
+  source.onerror = () => {
+    currentHandlers.onStatus?.(false)
+    source.close()
+    if (eventSource === source) eventSource = null
+
+    // Своя переподписка с нарастающей паузой: при перезапуске сервера
+    // браузер сам не поднимет поток, а человек не должен перезагружать страницу.
+    if (reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      if (Object.keys(currentHandlers).length) openEvents(callChatId)
+    }, 3000)
+  }
+}
+
+export function closeEvents() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+  currentHandlers = {}
+}
+
+export function eventsConnected(): boolean {
+  return eventSource?.readyState === EventSource.OPEN
+}
+
+// ─────────────────────────── сигнализация звонков ───────────────────────────
+
+/** Отправляет служебное сообщение звонка в комнату чата. */
+export async function sendCallSignal(chatId: string, payload: unknown): Promise<number> {
+  const result = await post<{ delivered: number }>(
+    `/api/call/${encodeURIComponent(chatId)}`,
+    payload,
+  )
+  return result.delivered ?? 0
+}
+
+/** Подтверждает, что этот чат слушается на предмет входящих звонков. */
+export async function subscribeCallRoom(chatId: string): Promise<string[]> {
+  const result = await post<{ online: string[] }>(
+    `/api/call/${encodeURIComponent(chatId)}/subscribe`,
+  )
+  return result.online ?? []
 }

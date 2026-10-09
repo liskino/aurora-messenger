@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { AtSign, KeyRound, Loader2, LogIn, ShieldCheck, UserPlus } from 'lucide-react'
 import { engine } from '@/lib/engine'
-import { isConfigured } from '@/lib/api'
+import { ServerStatus } from './ServerStatus'
 
 interface Props {
   onAuthed: () => void
@@ -29,10 +29,6 @@ export function AuthView({ onAuthed }: Props) {
     setError(null)
     setNotice(null)
 
-    if (!isConfigured) {
-      setError('Мессенджер не подключён к бэкенду: заполните .env.local (см. README).')
-      return
-    }
     if (mode === 'register' && !/^[a-zA-Z0-9_]{3,24}$/.test(username)) {
       setError('Логин: 3–24 символа, латиница, цифры и подчёркивание')
       return
@@ -53,13 +49,7 @@ export function AuthView({ onAuthed }: Props) {
         onAuthed()
       }
     } catch (err) {
-      const msg = (err as Error).message
-      // Supabase просит подтвердить почту — это не ошибка, а шаг регистрации.
-      if (/confirm|подтверд/i.test(msg)) {
-        setNotice('Проверьте почту и перейдите по ссылке из письма, затем войдите.')
-      } else {
-        setError(translateError(msg))
-      }
+      setError(translateError((err as Error).message))
     } finally {
       setBusy(false)
     }
@@ -84,6 +74,8 @@ export function AuthView({ onAuthed }: Props) {
           <h1 className="text-2xl font-bold tracking-tight text-white">Aurora</h1>
           <p className="mt-1 text-sm text-mist-400">Шифрование на устройстве, работа из любой сети</p>
         </div>
+
+        <ServerStatus />
 
         <div className="rounded-2xl border border-white/8 bg-ink-850/70 p-5 shadow-2xl shadow-black/40 backdrop-blur-xl">
           <div className="mb-5 flex rounded-xl bg-ink-800 p-1">
@@ -210,13 +202,16 @@ function Field({
   )
 }
 
-/** Понятные сообщения вместо кодов Supabase. */
+/** Понятные сообщения вместо кодов сервера. */
 function translateError(msg: string): string {
-  if (/Invalid login credentials/i.test(msg)) return 'Неверная почта или пароль'
-  if (/already registered/i.test(msg)) return 'Такая почта уже зарегистрирована — войдите'
-  if (/duplicate key.*username/i.test(msg)) return 'Этот логин уже занят'
-  if (/Password should be at least/i.test(msg)) return 'Пароль слишком короткий'
-  if (/rate limit/i.test(msg)) return 'Слишком много попыток, подождите минуту'
-  if (/Failed to fetch|NetworkError/i.test(msg)) return 'Нет связи с сервером — проверьте интернет'
+  if (/Неверная почта или пароль/i.test(msg)) return 'Неверная почта или пароль'
+  if (/уже зарегистрирована/i.test(msg)) return 'Такая почта уже зарегистрирована — войдите'
+  if (/логин уже занят/i.test(msg)) return 'Этот логин уже занят'
+  if (/Нет связи с сервером/i.test(msg)) {
+    return 'Сервер не отвечает. Запустите start.bat и обновите страницу.'
+  }
+  if (/Failed to fetch|NetworkError/i.test(msg)) {
+    return 'Сервер не отвечает. Запустите start.bat и обновите страницу.'
+  }
   return msg
 }

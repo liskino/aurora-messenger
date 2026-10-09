@@ -1,7 +1,7 @@
 /**
  * Звонки: голос, видео, демонстрация экрана.
  *
- * ─── Как это работает без своего сервера ──────────────────────────────
+ * ─── Как это работает без чужого сервера ─────────────────────────────
  *
  * Медиа между участниками идёт напрямую (peer-to-peer), а не через наш
  * сервер: браузеры договариваются сами. Шифрование потока — DTLS-SRTP,
@@ -10,8 +10,8 @@
  *
  * Чтобы участники нашли друг друга, нужен только обмен служебными
  * сообщениями: описанием сессии (SDP) и сетевыми кандидатами (ICE).
- * Для этого база данных не нужна — используется широковещательный канал
- * Supabase Realtime: сообщения живут, пока идёт звонок, и нигде не
+ * Для этого база данных не нужна — наши же события доставляют их
+ * участникам чата: сообщения живут, пока идёт звонок, и нигде не
  * сохраняются.
  *
  * ─── Почему нужен TURN ────────────────────────────────────────────────
@@ -20,7 +20,7 @@
  * Но если интернет-провайдер использует симметричный NAT (обычное дело в
  * мобильных сетях), прямое соединение не установится — нужен ретранслятор
  * TURN. Он передаёт уже зашифрованный поток, поэтому содержимое разговора
- * ему недоступно. Адрес TURN задаётся в .env.local.
+ * ему недоступно. Адрес TURN указывается в настройках мессенджера.
  *
  * ─── Топология ────────────────────────────────────────────────────────
  *
@@ -35,7 +35,7 @@
  * объявляет о себе, а предложения ему отправляют уже подключённые. Такой
  * порядок исключает столкновение при любом количестве участников.
  */
-import { supabase } from './api'
+import { sendCallSignal } from './api'
 import {
   actionsOf,
   initialState,
@@ -92,19 +92,41 @@ export function iceServers(): RTCIceServer[] {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
   ]
-  const turnUrl = import.meta.env.VITE_TURN_URL
+  const turnUrl = localStorage.getItem('aurora.turn.url')
   if (turnUrl) {
     servers.push({
       urls: turnUrl,
-      username: import.meta.env.VITE_TURN_USERNAME || undefined,
-      credential: import.meta.env.VITE_TURN_CREDENTIAL || undefined,
+      username: localStorage.getItem('aurora.turn.user') || undefined,
+      credential: localStorage.getItem('aurora.turn.pass') || undefined,
     })
   }
   return servers
 }
 
 export function hasTurn(): boolean {
-  return Boolean(import.meta.env.VITE_TURN_URL)
+  return Boolean(localStorage.getItem('aurora.turn.url'))
+}
+
+/** Настройка TURN из настроек мессенджера — без правки файлов. */
+export function configureTurn(url: string, username: string, credential: string) {
+  try {
+    if (url) localStorage.setItem('aurora.turn.url', url)
+    else localStorage.removeItem('aurora.turn.url')
+    if (username) localStorage.setItem('aurora.turn.user', username)
+    else localStorage.removeItem('aurora.turn.user')
+    if (credential) localStorage.setItem('aurora.turn.pass', credential)
+    else localStorage.removeItem('aurora.turn.pass')
+  } catch {
+    /* приватный режим */
+  }
+}
+
+export function turnConfig(): { url: string; username: string; credential: string } {
+  return {
+    url: localStorage.getItem('aurora.turn.url') ?? '',
+    username: localStorage.getItem('aurora.turn.user') ?? '',
+    credential: localStorage.getItem('aurora.turn.pass') ?? '',
+  }
 }
 
 /**
@@ -137,7 +159,6 @@ export function rtcSupported(): boolean {
 
 export class CallEngine {
   private listeners = new Set<Listener>()
-  private channel: ReturnType<typeof supabase.channel> | null = null
 
   private peerConnections = new Map<string, RTCPeerConnection>()
   private participants = new Map<string, CallParticipant>()
@@ -202,25 +223,28 @@ export class CallEngine {
 
   // ─────────────── канал связи ───────────────
 
+  /**
+   * Запоминает чат, в котором слушаются входящие звонки.
+   *
+   * Отдельного канала нет: служебные сообщения приходят по общему потоку
+   * событий приложения, а серверу нужно знать лишь то, в каком чате человек
+   * ждёт звонок. Это делает движок через setCallChat.
+   */
   private openChannel(chatId: string) {
-    if (this.channel) return
-    const channel = supabase.channel(`call:${chatId}`, {
-      // self: false — свои же сообщения не возвращаются, иначе бесконечный цикл.
-      config: { broadcast: { self: false } },
-    })
-
-    channel.on('broadcast', { event: 'signal' }, ({ payload }) => {
-      void this.handleSignal(payload as Signal)
-    })
-
-    channel.subscribe()
-    this.channel = channel
+    this.chatId = chatId
   }
 
   private async send(signal: Signal) {
-    if (!this.channel) return
-    // Служебное сообщение не должно сохраняться ни в базе, ни в истории.
-    await this.channel.send({ type: 'broadcast', event: 'signal', payload: signal })
+    const chatId = this.info?.chatId ?? this.chatId
+    if (!chatId) return
+    // Служебное сообщение живёт только во время разговора и в истории
+    // не сохраняется — в базе для него нет места.
+    await sendCallSignal(chatId, signal)
+  }
+
+  /** Вызывается движком, когда от сервера пришло служебное сообщение звонка. */
+  receiveSignal(payload: unknown) {
+    void this.handleSignal(payload as Signal)
   }
 
   // ─────────────── медиа ───────────────
@@ -730,11 +754,13 @@ export class CallEngine {
 
   // ─────────────── завершение ───────────────
 
+  /**
+   * Прекращает слушать звонки в чате.
+   * Отдельного соединения нет — общий поток событий остаётся открытым,
+   * поэтому закрывать здесь нечего.
+   */
   private closeChannel() {
-    if (this.channel) {
-      supabase.removeChannel(this.channel)
-      this.channel = null
-    }
+    /* ничего: поток событий общий на всё приложение */
   }
 
   private cleanup(reason: string) {
@@ -772,3 +798,18 @@ export class CallEngine {
 }
 
 export const calls = new CallEngine()
+
+/**
+ * Подключает звонки к общему потоку событий.
+ *
+ * Движок приложения получает служебные сообщения звонка и передаёт их сюда.
+ * Связь односторонняя и явная: rtc.ts не знает про движок, движок не знает
+ * про устройство звонка — иначе они образовали бы цикл импортов.
+ */
+export function connectCallsToEvents(engine: {
+  on: (fn: (e: { type: string; payload?: unknown }) => void) => () => void
+}): () => void {
+  return engine.on((e) => {
+    if (e.type === 'call' && e.payload) calls.receiveSignal(e.payload)
+  })
+}

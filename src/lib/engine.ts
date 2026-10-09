@@ -1,7 +1,7 @@
 /**
  * Движок мессенджера.
  *
- * Связывает криптоядро, хранилище устройства и Supabase. React-слой только
+ * Связывает криптоядро, хранилище устройства и сервер. React-слой только
  * подписывается на события и рисует — вся логика здесь.
  *
  * ─── Как раскладываются ключи чата ───────────────────────────────────
@@ -48,6 +48,8 @@ export type EngineEvent =
   | { type: 'reactions'; chatId: string; messageId: string }
   | { type: 'receipts'; chatId: string }
   | { type: 'presence' }
+  | { type: 'removed'; chatId: string }
+  | { type: 'call'; payload: unknown }
   | { type: 'error'; error: Error }
 
 type Listener = (e: EngineEvent) => void
@@ -63,7 +65,12 @@ function aadFor(chatId: string, senderId: string) {
 export class Engine {
   session: EngineSession | null = null
   private listeners = new Set<Listener>()
-  private channels = new Map<string, ReturnType<typeof api.supabase.channel>>()
+  /** Отписка от потока событий сервера — одно соединение на приложение. */
+  private eventsOff: (() => void) | null = null
+  /** Чат, открытый сейчас: нужен для адресации точечных обновлений. */
+  private lastChatId: string | null = null
+  /** Чат, в котором слушаются входящие звонки. */
+  private callChatId: string | null = null
   private messageCache = new Map<string, DecryptedMessage[]>()
   private profiles = new Map<string, Profile>()
   private chatCache = new Map<string, Chat>()
@@ -76,7 +83,6 @@ export class Engine {
   private reactions = new Map<string, Map<string, string>>()
   /** Кто сейчас в сети. */
   private online = new Set<string>()
-  private presenceChannel: ReturnType<typeof api.supabase.channel> | null = null
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   /** Отметки доставки и прочтения: messageId → состояние. */
   private receipts = new Map<string, { delivered: boolean; read: boolean }>()
@@ -99,21 +105,21 @@ export class Engine {
   // ═════════════════════════ вход ═════════════════════════
 
   /**
-   * Регистрация: аккаунт → личность → ключ из пароля → профиль.
-   * Профиль с открытым ключом появляется только когда ключи согласованы,
-   * иначе собеседник увидел бы аккаунт без ключа шифрования.
+   * Регистрация: сначала ключи, потом аккаунт.
+   *
+   * Порядок именно такой: сервер принимает ключи вместе с регистрацией,
+   * поэтому профиль не может появиться без открытого ключа. Иначе собеседник
+   * увидел бы аккаунт, которому нельзя отправить зашифрованное сообщение.
    */
   async register(email: string, password: string, username: string, displayName: string) {
-    const { user } = await api.signUp(email, password)
-    if (!user) throw new Error('Не удалось создать аккаунт')
-
     const identity = await crypto.generateIdentity()
     const salt = crypto.generateSalt()
     const passwordKey = await crypto.derivePasswordKey(password, salt)
     const wrappedPrivate = await crypto.wrapPrivateKey(identity.privateKey, passwordKey)
 
-    await api.createProfile({
-      id: user.id,
+    const result = await api.register({
+      email,
+      password,
       username: username.toLowerCase(),
       display_name: displayName || username,
       public_key: identity.publicKeyB64,
@@ -122,15 +128,13 @@ export class Engine {
       kdf_iterations: crypto.PBKDF2_ITERATIONS,
     })
 
-    await this.rememberDevice(user.id, wrappedPrivate)
+    await this.rememberDevice(result.user.id, identity.privateKey)
 
-    const profile = await api.getProfile(user.id)
-    if (!profile) throw new Error('Профиль не создан')
-    this.profiles.set(profile.id, profile)
+    this.profiles.set(result.profile.id, result.profile)
     this.session = {
-      userId: user.id,
-      email,
-      profile,
+      userId: result.user.id,
+      email: result.user.email,
+      profile: result.profile,
       privateKey: identity.privateKey,
       chatKeys: new Map(),
       localWrapped: new Map(),
@@ -145,19 +149,33 @@ export class Engine {
    *   2. устройства нет → разворачиваем ключ паролем и запоминаем устройство.
    */
   async login(email: string, password: string | null) {
-    const supa = await api.currentSession()
-    if (!supa) throw new Error('Сессия не найдена — войдите заново')
+    // Пароль нужен серверу только для входа в аккаунт. Ключ шифрования
+    // выводится из него отдельно, в браузере, и на сервер не уходит.
+    if (!password) {
+      const existing = await api.currentSession()
+      if (!existing) throw new Error('Сессия истекла — введите пароль')
+      const privateKey = await this.unlockPrivateKey(existing.profile, null)
+      this.profiles.set(existing.profile.id, existing.profile)
+      this.session = {
+        userId: existing.user.id,
+        email: existing.user.email,
+        profile: existing.profile,
+        privateKey,
+        chatKeys: new Map(),
+        localWrapped: new Map(),
+      }
+      await this.beginSession()
+      return this.session
+    }
 
-    const profile = await api.getProfile(supa.user.id)
-    if (!profile) throw new Error('Профиль не найден')
+    const result = await api.login(email, password)
+    const privateKey = await this.unlockPrivateKey(result.profile, password)
 
-    const privateKey = await this.unlockPrivateKey(profile, password)
-
-    this.profiles.set(profile.id, profile)
+    this.profiles.set(result.profile.id, result.profile)
     this.session = {
-      userId: supa.user.id,
-      email: supa.user.email ?? email,
-      profile,
+      userId: result.user.id,
+      email: result.user.email,
+      profile: result.profile,
       privateKey,
       chatKeys: new Map(),
       localWrapped: new Map(),
@@ -190,30 +208,28 @@ export class Engine {
     } catch {
       throw new Error('Неверный пароль')
     }
-    await this.rememberDevice(profile.id, profile.wrapped_private)
+    await this.rememberDevice(profile.id, privateKey)
     return privateKey
   }
 
   /**
-   * Автовход при открытии страницы: сессия Supabase жива и устройство
+   * Автовход при открытии страницы: сессия сервера жива и устройство
    * запомнено — пользователь ничего не вводит.
    */
   async resume(): Promise<EngineSession | null> {
-    const supa = await api.currentSession()
-    if (!supa) return null
+    const existing = await api.currentSession()
+    if (!existing) return null
 
-    const device = await vault.getDevice(supa.user.id)
+    const device = await vault.getDevice(existing.user.id)
     if (!device) return null
 
     try {
       const privateKey = await crypto.unwrapPrivateKey(device.wrappedPrivate, device.key)
-      const profile = await api.getProfile(supa.user.id)
-      if (!profile) return null
-      this.profiles.set(profile.id, profile)
+      this.profiles.set(existing.profile.id, existing.profile)
       this.session = {
-        userId: supa.user.id,
-        email: supa.user.email ?? '',
-        profile,
+        userId: existing.user.id,
+        email: existing.user.email,
+        profile: existing.profile,
         privateKey,
         chatKeys: new Map(),
         localWrapped: new Map(),
@@ -221,14 +237,30 @@ export class Engine {
       await this.beginSession()
       return this.session
     } catch {
+      // Автовход не удался — человек увидит обычный экран входа
+      // и сможет ввести пароль. Ломать из-за этого приложение нельзя.
       return null
     }
   }
 
-  /** Создаёт неизвлекаемый ключ устройства и оборачивает им приватный ключ. */
-  private async rememberDevice(userId: string, wrappedPrivate: string) {
+  /**
+   * Запоминает устройство: пересобирает обёртку приватного ключа на ключ
+   * устройства и кладёт её в IndexedDB.
+   *
+   * Здесь была ошибка, из-за которой вход без пароля не работал вообще.
+   * Раньше сюда передавалась обёртка, сделанная на ключ ИЗ ПАРОЛЯ, а рядом
+   * сохранялся ключ устройства — и при следующем запуске ключ пытались снять
+   * ключом устройства. Эти два ключа друг о друге ничего не знают, поэтому
+   * расшифровка всегда срывалась, и человек каждый раз вводил пароль заново.
+   *
+   * Правильно: взять сам приватный ключ и заново зашифровать его ключом
+   * устройства. Ключ из пароля остаётся только на сервере — как резервная
+   * копия для входа с нового устройства.
+   */
+  private async rememberDevice(userId: string, privateKey: CryptoKey) {
     const deviceKey = await crypto.createDeviceKey()
-    await vault.putDeviceKey(userId, deviceKey, wrappedPrivate)
+    const wrappedForDevice = await crypto.wrapPrivateKey(privateKey, deviceKey)
+    await vault.putDeviceKey(userId, deviceKey, wrappedForDevice)
     this.deviceKeyPromise = Promise.resolve(deviceKey)
   }
 
@@ -263,9 +295,15 @@ export class Engine {
 
   async logout() {
     if (this.session) await vault.forgetDevice(this.session.userId)
-    for (const ch of this.channels.values()) api.supabase.removeChannel(ch)
-    this.channels.clear()
-    this.stopPresence()
+
+    // Закрываем поток событий до выхода: иначе сервер продолжит слать
+    // события уже вышедшему клиенту.
+    if (this.eventsOff) {
+      this.eventsOff()
+      this.eventsOff = null
+    }
+    api.closeEvents()
+
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
@@ -275,11 +313,14 @@ export class Engine {
     this.chatCache.clear()
     this.membership.clear()
     this.reactions.clear()
+    this.online.clear()
     this.seen.clear()
     this.deviceKeyPromise = null
     this.deviceId = null
+    this.lastChatId = null
+    this.callChatId = null
     this.session = null
-    await api.signOut()
+    await api.logout()
   }
 
   async devices() {
@@ -391,6 +432,10 @@ export class Engine {
   /**
    * Создаёт чат и раскладывает ключ чата каждому участнику.
    * Личный чат — двое участников, группа — трое и больше.
+   *
+   * Ключи считаются ДО обращения к серверу и передаются вместе с созданием:
+   * чат не может существовать без выданных ключей, иначе собеседник увидел бы
+   * переписку, которую невозможно прочитать.
    */
   async createChat(members: Profile[], title: string | null = null): Promise<Chat> {
     const me = this.session!
@@ -398,23 +443,23 @@ export class Engine {
     const all = [me.profile, ...others]
     const kind = all.length > 2 ? 'group' : 'direct'
 
-    const chat = await api.createChat(kind, title, me.userId)
-    this.chatCache.set(chat.id, chat)
-
     const chatKey = await crypto.generateChatKey()
-    const rows = await Promise.all(
+    const memberRows = await Promise.all(
       all.map(async (member) => ({
-        chat_id: chat.id,
         user_id: member.id,
         // Для себя считаем секрет ECDH со своим же открытым ключом —
         // он снимается тем же кодом, что и у остальных участников.
         wrapped_key: await this.wrapFor(chatKey, member.public_key),
       })),
     )
-    await api.upsertMembers(rows)
 
-    for (const r of rows) {
-      if (r.user_id === me.userId) this.membership.set(chat.id, r as ChatMember)
+    const chat = await api.createChat(kind, title, me.userId, memberRows)
+    this.chatCache.set(chat.id, chat)
+
+    for (const r of memberRows) {
+      if (r.user_id === me.userId) {
+        this.membership.set(chat.id, { ...r, chat_id: chat.id, joined_at: new Date().toISOString() })
+      }
     }
     me.chatKeys.set(chat.id, chatKey)
     const localWrap = await crypto.wrapChatKey(chatKey, await this.deviceKey())
@@ -558,8 +603,11 @@ export class Engine {
   }
 
   /**
-   * Отправка файла: шифруем потоком блоками по 1 МиБ, в Storage лежит
-   * только шифротекст. Имя файла тоже зашифровано.
+   * Отправка файла: шифруем блоками по 1 МиБ, на сервере лежит только
+   * шифротекст. Имя файла шифруется отдельно и серверу не видно.
+   *
+   * Путь назначает сервер: раньше его придумывал клиент, и два человека
+   * теоретически могли занять одно имя.
    */
   async sendFile(
     chatId: string,
@@ -570,8 +618,7 @@ export class Engine {
     const key = await this.keyForChat(chatId)
     const sealed = await crypto.sealFile(file, key)
 
-    const path = `${chatId}/${crypto.toB64(crypto.randomBytes(16)).replace(/[+/=]/g, '')}.bin`
-    await api.uploadEncrypted(path, sealed.blob, onProgress)
+    const uploaded = await api.uploadEncrypted(chatId, sealed.blob, onProgress)
 
     const wrappedFileKey = await crypto.wrapChatKey(sealed.key, key)
     const row = await api.sendMessage({
@@ -580,7 +627,7 @@ export class Engine {
       ciphertext: '',
       iv: '',
       kind: 'file',
-      file_path: path,
+      file_path: uploaded.path,
       file_name_sealed: sealed.nameSealed.ciphertext,
       file_name_iv: sealed.nameSealed.iv,
       file_type: sealed.type,
@@ -619,109 +666,161 @@ export class Engine {
     return merged
   }
 
-  // ═════════════════════════ realtime ═════════════════════════
+// ═════════════════════════ realtime ═════════════════════════
 
-  /** Подписка на чат: новые сообщения и «печатает». */
+  /**
+   * Единая подписка на события сервера.
+   *
+   * Вместо канала на каждый чат — одно соединение на приложение: сообщения,
+   * реакции, отметки, «печатает», присутствие и служебные сообщения звонков
+   * приходят по нему. Меньше соединений — меньше нагрузки и на сервер, и на
+   * браузер, а переподключение после перезапуска сервера берёт на себя
+   * клиентский слой API.
+   *
+   * Обработчики намеренно не зависят от открытого чата: сообщение для любого
+   * чата из списка должно попасть в кэш и увеличить счётчик непрочитанных.
+   */
   subscribeChat(chatId: string) {
-    if (this.channels.has(chatId)) return
-    const me = this.session
-    if (!me) return
+    this.lastChatId = chatId
+    this.ensureEvents()
+  }
 
-    const channel = api.supabase
-      .channel(`chat:${chatId}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
-        async ({ new: row }) => {
-          const m = row as Message
-          if (this.seen.has(m.id)) return
-          const key = await this.keyForChat(chatId)
-          const msg = await this.decryptOne(m, key)
-          this.seen.add(m.id)
-          this.pushToCache(chatId, msg)
-          this.emit({ type: 'message', chatId, message: msg })
-          if (m.sender_id !== this.session!.userId) {
-            void api.markDelivered([m.id], this.session!.userId).then(() => {
-              this.receipts.set(m.id, { delivered: true, read: false })
-            })
-          }
-        },
-      )
-      // Правка и удаление чужих изменений не приходят: RLS пускает только
-      // свои строки. Но своё сообщение, изменённое на другом устройстве,
-      // должно обновиться и здесь.
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
-        async ({ new: row }) => {
-          const m = row as Message
-          if (!this.seen.has(m.id)) return
-          const key = await this.keyForChat(chatId)
-          const msg = await this.decryptOne(m, key)
-          const list = (this.messageCache.get(chatId) ?? []).map((x) => (x.id === m.id ? msg : x))
-          this.messageCache.set(chatId, list)
-          this.emit({ type: 'edited', chatId, message: msg })
-        },
-      )
-      .on(
-        'postgres_changes',
-        { event: 'DELETE', schema: 'public', table: 'messages' },
-        ({ old: row }) => {
-          const id = (row as { id?: string })?.id
-          if (!id) return
+  private ensureEvents() {
+    if (!this.session || this.eventsOff) return
+
+    this.eventsOff = api.subscribeEvents(
+      {
+        onMessage: (row) => void this.handleIncoming(row),
+        onMessageUpdated: (row) => void this.handleUpdated(row),
+        onMessageDeleted: (id, chatId) => {
           const list = (this.messageCache.get(chatId) ?? []).filter((m) => m.id !== id)
           this.messageCache.set(chatId, list)
           this.seen.delete(id)
           this.emit({ type: 'deleted', chatId, messageId: id })
         },
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'typing', filter: `chat_id=eq.${chatId}` },
-        ({ new: row }) => {
-          const r = row as { user_id?: string } | null
-          if (!r?.user_id || r.user_id === this.session?.userId) return
-          this.emit({ type: 'typing', chatId, userId: r.user_id })
+        onTyping: (chatId, userId) => {
+          if (!userId || userId === this.session?.userId) return
+          this.emit({ type: 'typing', chatId, userId })
         },
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'reactions' },
-        ({ new: row }) => {
-          const r = row as { message_id?: string; user_id?: string; emoji?: string } | null
-          if (!r?.message_id || !r.user_id || !r.emoji) return
-          const set = this.reactions.get(r.message_id) ?? new Map<string, string>()
-          set.set(r.user_id, r.emoji)
-          this.reactions.set(r.message_id, set)
-          this.emit({ type: 'reactions', chatId, messageId: r.message_id })
+        onReceipt: (receipts) => {
+          let touchedChat = ''
+          for (const r of receipts) {
+            // Свои отметки пропускаем: они говорят о том, что читаем мы.
+            if (r.user_id === this.session?.userId) continue
+            const prev = this.receipts.get(r.message_id) ?? { delivered: false, read: false }
+            this.receipts.set(r.message_id, {
+              delivered: prev.delivered || Boolean(r.delivered_at),
+              read: prev.read || Boolean(r.read_at),
+            })
+            touchedChat ||= this.chatIdOfMessage(r.message_id)
+          }
+          this.emit({ type: 'receipts', chatId: touchedChat })
         },
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'receipts' },
-        ({ new: row }) => {
-          const r = row as { message_id?: string; user_id?: string; delivered_at?: string; read_at?: string } | null
-          // Свои отметки игнорируем: они говорят о том, что читаем мы, а не нам.
-          if (!r?.message_id || r.user_id === this.session?.userId) return
-          const prev = this.receipts.get(r.message_id) ?? { delivered: false, read: false }
-          this.receipts.set(r.message_id, {
-            delivered: prev.delivered || Boolean(r.delivered_at),
-            read: prev.read || Boolean(r.read_at),
-          })
-          this.emit({ type: 'receipts', chatId })
+        onReaction: (messageId, userId, emoji) => {
+          const set = this.reactions.get(messageId) ?? new Map<string, string>()
+          if (emoji) set.set(userId, emoji)
+          else set.delete(userId)
+          if (set.size) this.reactions.set(messageId, set)
+          else this.reactions.delete(messageId)
+          this.emit({ type: 'reactions', chatId: this.chatIdOfMessage(messageId), messageId })
         },
-      )
-      .subscribe()
-
-    this.channels.set(chatId, channel)
+        onPresence: (online) => {
+          this.online = new Set(online)
+          this.emit({ type: 'presence' })
+        },
+        onChat: (chat) => {
+          this.chatCache.set(chat.id, chat)
+          this.emit({ type: 'chat', chat })
+        },
+        onRemoved: (chatId) => {
+          // Нас исключили из чата: убираем его и забываем ключ.
+          this.chatCache.delete(chatId)
+          this.messageCache.delete(chatId)
+          this.session?.chatKeys.delete(chatId)
+          this.session?.localWrapped.delete(chatId)
+          void vault.dropChatKey(chatId)
+          this.emit({ type: 'removed', chatId })
+        },
+        onCall: (payload) => {
+          this.emit({ type: 'call', payload })
+        },
+      },
+      this.callChatId,
+    )
   }
 
-  unsubscribeChat(chatId: string) {
-    const ch = this.channels.get(chatId)
-    if (ch) {
-      api.supabase.removeChannel(ch)
-      this.channels.delete(chatId)
+  /** В каком чате находится сообщение — нужно для точечных обновлений. */
+  private chatIdOfMessage(messageId: string): string {
+    for (const [chatId, list] of this.messageCache) {
+      if (list.some((m) => m.id === messageId)) return chatId
     }
+    return this.lastChatId ?? ''
+  }
+
+  /** Расшифровывает пришедшее сообщение и раскладывает его по кэшам. */
+  private async handleIncoming(row: Message) {
+    const me = this.session
+    if (!me || this.seen.has(row.id)) return
+
+    const chatId = row.chat_id
+    let msg: DecryptedMessage
+    try {
+      const key = await this.keyForChat(chatId)
+      msg = await this.decryptOne(row, key)
+    } catch {
+      // Ключа чата ещё нет — обычная ситуация, когда чат только что создали.
+      // Показываем сообщение как нерасшифрованное, но не теряем его.
+      msg = { ...row, text: '', failed: true }
+    }
+
+    this.seen.add(row.id)
+    this.pushToCache(chatId, msg)
+    this.emit({ type: 'message', chatId, message: msg })
+
+    if (row.sender_id !== me.userId) {
+      void api.markDelivered([row.id], me.userId).then(() => {
+        this.receipts.set(row.id, { delivered: true, read: false })
+      })
+    }
+  }
+
+  private async handleUpdated(row: Message) {
+    if (!this.seen.has(row.id)) return
+    const chatId = row.chat_id
+    try {
+      const key = await this.keyForChat(chatId)
+      const msg = await this.decryptOne(row, key)
+      const list = (this.messageCache.get(chatId) ?? []).map((x) => (x.id === row.id ? msg : x))
+      this.messageCache.set(chatId, list)
+      this.emit({ type: 'edited', chatId, message: msg })
+    } catch {
+      /* правка не расшифровалась — оставляем прежний текст */
+    }
+  }
+
+  /**
+   * Сообщает серверу, в каком чате слушать входящие звонки.
+   * Переподключение потока делается только при реальной смене чата:
+   * сообщения и так приходят для всех чатов сразу.
+   */
+  setCallChat(chatId: string | null) {
+    if (this.callChatId === chatId) return
+    this.callChatId = chatId
+    if (this.session && this.eventsOff) {
+      this.eventsOff()
+      this.eventsOff = null
+      this.ensureEvents()
+    }
+  }
+
+  /** Отдельных подписок на чат больше нет: поток один на всё приложение. */
+  unsubscribeChat(_chatId: string) {
+    /* метод оставлен, чтобы вызывающий код не пришлось переписывать */
+  }
+
+  /** Шлёт служебное сообщение звонка другим участникам чата. */
+  async sendCallSignal(chatId: string, payload: unknown): Promise<number> {
+    return api.sendCallSignal(chatId, payload)
   }
 
   /** «Печатает» с троттлингом: не чаще одной записи в 3 секунды на чат. */
@@ -824,15 +923,9 @@ export class Engine {
     const key = await this.keyForChat(chatId)
     const sealed = await crypto.sealTextAAD(newText, key, aadFor(chatId, me.userId))
 
-    const { error } = await api.supabase
-      .from('messages')
-      .update({
-        ciphertext: sealed.ciphertext,
-        iv: sealed.iv,
-        edited_at: new Date().toISOString(),
-      })
-      .eq('id', messageId)
-    if (error) throw error
+    // Старый шифротекст стирается на сервере: иначе изменённый текст
+    // остался бы в базе в прежнем виде.
+    await api.editMessage(messageId, sealed.ciphertext, sealed.iv)
 
     const updated: DecryptedMessage = {
       ...cached,
@@ -893,21 +986,15 @@ export class Engine {
 
   // ═════════════════════════ присутствие ═════════════════════════
 
-  /** Кто сейчас в сети. Обновляется автоматически при входе и выходе. */
+  /**
+   * Кто сейчас в сети.
+   *
+   * Отдельной подписки нет: сервер сам присылает список присутствующих по
+   * тому же потоку событий, что и сообщения. Наличие потока и означает, что
+   * человек в сети — поэтому ничего дополнительно отслеживать не нужно.
+   */
   startPresence() {
-    const me = this.session
-    if (!me || this.presenceChannel) return
-    this.presenceChannel = api.presenceChannel(me.userId, (online) => {
-      this.online = new Set(online)
-      this.emit({ type: 'presence' })
-    })
-  }
-
-  stopPresence() {
-    if (!this.presenceChannel) return
-    void api.supabase.removeChannel(this.presenceChannel)
-    this.presenceChannel = null
-    this.online.clear()
+    this.ensureEvents()
   }
 
   isOnline(userId: string): boolean {

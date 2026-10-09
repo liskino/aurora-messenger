@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, MessageSquare, ShieldCheck } from 'lucide-react'
 import { engine, type EngineSession } from '@/lib/engine'
-import { isConfigured } from '@/lib/api'
-import { calls } from '@/lib/rtc'
+import { calls, connectCallsToEvents } from '@/lib/rtc'
 import {
   isWindowActive,
   notifyMessage,
@@ -20,7 +19,7 @@ import { Sidebar } from '@/components/Sidebar'
 import { SettingsPanel } from '@/components/SettingsPanel'
 import { GroupPanel } from '@/components/GroupPanel'
 import { CallOverlay } from '@/components/CallOverlay'
-import { ConnectionWarning } from '@/components/ConnectionWarning'
+import { ServerStatus } from '@/components/ServerStatus'
 import type { Chat, Profile } from '@/lib/types'
 
 type Phase = 'booting' | 'auth' | 'ready'
@@ -39,19 +38,27 @@ export default function App() {
   const activeChatRef = useRef<Chat | null>(null)
   activeChatRef.current = activeChat
 
+  /** Последний открытый чат — чтобы после перезагрузки вернуться в него. */
+  const LAST_CHAT_KEY = 'aurora.lastChat'
+
+  const rememberChat = useCallback((chat: Chat | null) => {
+    try {
+      if (chat) localStorage.setItem(LAST_CHAT_KEY, chat.id)
+      else localStorage.removeItem(LAST_CHAT_KEY)
+    } catch {
+      /* приватный режим может запрещать localStorage */
+    }
+  }, [])
+
   const { chats, peers, members, lastMessage, loading, addChat } = useChats(
     phase === 'ready',
     session?.userId,
   )
 
-  // Автовход: сессия Supabase жива и устройство запомнено → пароль не нужен.
+  // Автовход: сессия сервера жива и устройство запомнено → пароль не нужен.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      if (!isConfigured) {
-        setPhase('auth')
-        return
-      }
       try {
         const s = await engine.resume()
         if (cancelled) return
@@ -69,6 +76,13 @@ export default function App() {
       cancelled = true
     }
   }, [])
+
+  // Служебные сообщения звонков приходят по общему потоку событий:
+  // связываем их с устройством звонка один раз за сессию.
+  useEffect(() => {
+    if (phase !== 'ready') return
+    return connectCallsToEvents(engine)
+  }, [phase])
 
   // Звонок начался или пришёл — открываем экран звонка.
   useEffect(() => {
@@ -167,16 +181,21 @@ export default function App() {
     setSession(null)
     setActiveChat(null)
     setActivePeer(undefined)
+    rememberChat(null)
     resetTitle()
     setPhase('auth')
-  }, [])
+  }, [rememberChat])
 
-  const selectChat = useCallback((chat: Chat, peer: Profile | undefined) => {
-    setActiveChat(chat)
-    setActivePeer(peer)
-    setMobilePane('chat')
-    resetTitle()
-  }, [])
+  const selectChat = useCallback(
+    (chat: Chat, peer: Profile | undefined) => {
+      setActiveChat(chat)
+      setActivePeer(peer)
+      setMobilePane('chat')
+      rememberChat(chat)
+      resetTitle()
+    },
+    [rememberChat],
+  )
 
   const onCreated = useCallback(
     (chat: Chat, peer: Profile | undefined) => {
@@ -184,9 +203,32 @@ export default function App() {
       setActiveChat(chat)
       setActivePeer(peer)
       setMobilePane('chat')
+      rememberChat(chat)
     },
-    [addChat],
+    [addChat, rememberChat],
   )
+
+  /**
+   * Возвращает человека в последний открытый чат после перезагрузки.
+   *
+   * Иначе после обновления страницы или автовхода он каждый раз видел бы
+   * «Выберите чат» и заново искал переписку — при том, что мессенджер её уже
+   * расшифровал и держит в кэше.
+   */
+  useEffect(() => {
+    if (phase !== 'ready' || activeChat || !chats.length) return
+    let saved: string | null = null
+    try {
+      saved = localStorage.getItem(LAST_CHAT_KEY)
+    } catch {
+      saved = null
+    }
+    if (!saved) return
+    const chat = chats.find((c) => c.id === saved)
+    if (!chat) return
+    setActiveChat(chat)
+    setActivePeer(peers.get(chat.id))
+  }, [phase, chats, peers, activeChat])
 
   if (phase === 'booting') {
     return (
@@ -202,7 +244,7 @@ export default function App() {
   if (phase === 'auth') {
     return (
       <>
-        {!isConfigured && <ConnectionWarning />}
+        <ServerStatus />
         <AuthView onAuthed={onAuthed} />
       </>
     )
