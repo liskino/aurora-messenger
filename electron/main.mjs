@@ -13,7 +13,7 @@
 import { app, BrowserWindow, shell, dialog } from 'electron'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -94,6 +94,71 @@ async function startServer() {
   return { port, server, db }
 }
 
+// ─────────────────────────── удалённый сервер ───────────────────────────
+
+/**
+ * Публичный сервер: та же Aurora, но общая — как веб-версия.
+ *
+ * Приложение — теперь «клиент» наравне с браузером: если на GitHub опубликована
+ * живая ссылка, окно открывает её, и переписка общая с веб-версией. Ссылку
+ * публикует start-public.ps1 на домашнем ПК (меняется при каждом запуске —
+ * поэтому читаем её каждый раз при старте, а не храним).
+ */
+const REMOTE_URL_FILE =
+  'https://raw.githubusercontent.com/liskino/aurora-messenger/master/server-url.txt'
+
+/** Ручной адрес: файл server.txt рядом с данными (userData). */
+function manualServerUrl() {
+  try {
+    const manual = readFileSync(join(app.getPath('userData'), 'server.txt'), 'utf8').trim()
+    if (/^https?:\/\//.test(manual)) return manual
+  } catch {
+    /* файла нет — обычный случай */
+  }
+  return null
+}
+
+/** Живая ли ссылка: сервер должен ответить на /api/health. */
+async function alive(url) {
+  try {
+    const res = await fetch(`${url.replace(/\/+$/, '')}/api/health`, {
+      signal: AbortSignal.timeout(8000),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Решает, к какому серверу подключаться.
+ *
+ * Порядок: файл server.txt (ручной адрес) → GitHub server-url.txt → null.
+ * Ссылка с GitHub проверяется на живость: «OFFLINE» или мёртвый адрес
+ * означают «сервер не включён», и программа честно поднимает свой
+ * локальный сервер, как раньше.
+ */
+async function resolveRemoteServer() {
+  const manual = manualServerUrl()
+  if (manual) {
+    if (await alive(manual)) return manual
+    console.log('AURORA_REMOTE_MANUAL_DEAD')
+    return null
+  }
+
+  try {
+    const res = await fetch(REMOTE_URL_FILE, { signal: AbortSignal.timeout(8000) })
+    if (!res.ok) return null
+    const first = (await res.text()).split('\n')[0].trim()
+    if (!/^https?:\/\//.test(first)) return null // OFFLINE или мусор
+    if (await alive(first)) return first
+    console.log('AURORA_REMOTE_STALE')
+  } catch {
+    /* нет интернета — тихо падаем на локальный сервер */
+  }
+  return null
+}
+
 // ─────────────────────────── окно ───────────────────────────
 
 function createWindow(url) {
@@ -117,10 +182,24 @@ function createWindow(url) {
 
   win.once('ready-to-show', () => win.show())
 
+  // Публичная ссылка меняется при перезапуске сервера: если страница не
+  // загрузилась, перечитываем адрес и перезагружаем окно один раз.
+  if (url.startsWith('https://')) {
+    win.webContents.on('did-fail-load', async (_e, code) => {
+      if (code === -3 /* ERR_ABORTED */) return
+      const fresh = manualServerUrl() ?? (await resolveRemoteServer())
+      if (fresh && fresh !== url) void win.loadURL(fresh)
+    })
+  }
+
   // Ссылки из переписки открываются в браузере, а не внутри мессенджера:
   // чужой сайт внутри окна программы выглядел бы как её часть.
   win.webContents.setWindowOpenHandler(({ url: target }) => {
-    if (target.startsWith('http://localhost') || target.startsWith('http://127.0.0.1')) {
+    if (
+      target.startsWith('http://localhost') ||
+      target.startsWith('http://127.0.0.1') ||
+      target.startsWith('https://') && target.endsWith('.trycloudflare.com')
+    ) {
       return { action: 'allow' }
     }
     void shell.openExternal(target)
@@ -135,10 +214,19 @@ function createWindow(url) {
 
 app.whenReady().then(async () => {
   try {
-    const { port } = await startServer()
-    console.log('AURORA_SERVER_PORT=' + port)
+    // Сначала — публичный сервер с GitHub (общая база с веб-версией).
+    const remote = await resolveRemoteServer()
 
-    mainWindow = createWindow(`http://127.0.0.1:${port}`)
+    if (remote) {
+      console.log('AURORA_REMOTE=' + remote)
+      mainWindow = createWindow(remote)
+    } else {
+      // Публичного нет — поднимаем свой, как раньше.
+      const { port } = await startServer()
+      console.log('AURORA_SERVER_PORT=' + port)
+      mainWindow = createWindow(`http://127.0.0.1:${port}`)
+    }
+
     mainWindow.on('closed', () => {
       mainWindow = null
     })
