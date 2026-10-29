@@ -24,6 +24,7 @@
   "dependencies": {
     "idb": "^8.0.0",
     "lucide-react": "^0.454.0",
+    "node-turn": "^0.0.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -65,11 +66,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },

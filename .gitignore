@@ -13,4 +13,4 @@ data-app-test
 coverage
 bench/out
 aurora-server.log
-.data-backup*
+.data-backup*txtchat

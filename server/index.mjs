@@ -31,6 +31,7 @@ import { randomUUID } from 'node:crypto'
 import * as db from './db.mjs'
 import * as auth from './auth.mjs'
 import * as rt from './realtime.mjs'
+import * as turn from './turn.mjs'
 
 const PORT = Number(process.env.PORT || 4321)
 const HOST = process.env.HOST || '0.0.0.0'
@@ -196,7 +197,24 @@ route('GET', '/api/health', async (_req, res) => {
     realtime: rt.stats(),
     // Клиент показывает это на экране входа, чтобы было видно: сервер свой.
     capabilities: { calls: true, files: true, groups: true, e2e: true },
+    turn: turn.turnStatus(),
   })
+})
+
+/**
+ * Настройки ICE для звонков.
+ *
+ * Клиент получает готовый список серверов — включая встроенный TURN —
+ * и сразу использует его в звонке. Человеку не нужно ничего вводить.
+ */
+route('GET', '/api/ice', async (req, res, url) => {
+  const user = requireUser(req, res, url)
+  if (!user) return
+
+  // Адрес берём из запроса: клиент обращается к серверу по конкретному
+  // хосту, и TURN должен быть доступен по тому же адресу.
+  const host = (req.headers.host || '127.0.0.1').split(':')[0]
+  json(res, 200, { iceServers: turn.iceServersFor(host) })
 })
 
 // ── регистрация и вход ──
@@ -1031,6 +1049,17 @@ const server = createServer(async (req, res) => {
 
 export function start(port = PORT, host = HOST) {
   db.openDatabase()
+
+  // Встроенный STUN/TURN поднимается вместе с сервером. Это решает главную
+  // проблему звонков: без ретранслятора соединение между мобильным
+  // интернетом и домашним Wi-Fi не устанавливается из-за симметричного NAT.
+  const turnInfo = turn.startTurn(db.DATA_DIR)
+  if (turnInfo) {
+    console.log(`AURORA_TURN_PORT=${turnInfo.port}`)
+  } else {
+    // Не беда: мессенджер и звонки внутри одной сети работают без TURN.
+    console.log('AURORA_TURN_PORT=0')
+  }
 
   /**
    * Запуск с автоматическим подбором порта.

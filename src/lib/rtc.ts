@@ -35,7 +35,7 @@
  * объявляет о себе, а предложения ему отправляют уже подключённые. Такой
  * порядок исключает столкновение при любом количестве участников.
  */
-import { sendCallSignal } from './api'
+import * as api from './api'
 import {
   actionsOf,
   initialState,
@@ -83,50 +83,46 @@ type Listener = (e: CallEvent) => void
 // ─────────────────────────── конфигурация ICE ───────────────────────────
 
 /**
- * Публичные STUN плюс необязательный TURN из настроек.
- * Без TURN звонки работают в большинстве домашних сетей, но могут не
- * установиться между мобильным интернетом и Wi-Fi.
+ * Список ICE-серверов, полученный от сервера.
+ *
+ * Сервер отдаёт его при входе: STUN из интернета плюс встроенный TURN.
+ * TURN встроен в саму программу, поэтому настраивать ничего не нужно —
+ * именно это и решает проблему звонков между разными сетями.
+ *
+ * Если сервер не ответил, остаются публичные STUN: звонки внутри одной
+ * сети будут работать, между разными — возможно, нет.
  */
-export function iceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ]
-  const turnUrl = localStorage.getItem('aurora.turn.url')
-  if (turnUrl) {
-    servers.push({
-      urls: turnUrl,
-      username: localStorage.getItem('aurora.turn.user') || undefined,
-      credential: localStorage.getItem('aurora.turn.pass') || undefined,
-    })
-  }
-  return servers
-}
+let iceServerList: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+]
 
-export function hasTurn(): boolean {
-  return Boolean(localStorage.getItem('aurora.turn.url'))
-}
+let turnAvailable = false
 
-/** Настройка TURN из настроек мессенджера — без правки файлов. */
-export function configureTurn(url: string, username: string, credential: string) {
+/** Загружает настройки ICE с сервера. Вызывается при входе. */
+export async function loadIceServers(): Promise<void> {
   try {
-    if (url) localStorage.setItem('aurora.turn.url', url)
-    else localStorage.removeItem('aurora.turn.url')
-    if (username) localStorage.setItem('aurora.turn.user', username)
-    else localStorage.removeItem('aurora.turn.user')
-    if (credential) localStorage.setItem('aurora.turn.pass', credential)
-    else localStorage.removeItem('aurora.turn.pass')
+    const list = await api.fetchIceServers()
+    if (list.length) {
+      iceServerList = list
+      // Считаем TURN доступным, если в списке есть его адрес.
+      turnAvailable = list.some((s) => {
+        const urls = Array.isArray(s.urls) ? s.urls : [s.urls]
+        return urls.some((u) => u.startsWith('turn:') || u.startsWith('turns:'))
+      })
+    }
   } catch {
-    /* приватный режим */
+    /* остаются публичные STUN */
   }
 }
 
-export function turnConfig(): { url: string; username: string; credential: string } {
-  return {
-    url: localStorage.getItem('aurora.turn.url') ?? '',
-    username: localStorage.getItem('aurora.turn.user') ?? '',
-    credential: localStorage.getItem('aurora.turn.pass') ?? '',
-  }
+export function iceServers(): RTCIceServer[] {
+  return iceServerList
+}
+
+/** Доступен ли ретранслятор — от этого зависит, пройдёт ли звонок из другой сети. */
+export function hasTurn(): boolean {
+  return turnAvailable
 }
 
 /**
@@ -239,7 +235,7 @@ export class CallEngine {
     if (!chatId) return
     // Служебное сообщение живёт только во время разговора и в истории
     // не сохраняется — в базе для него нет места.
-    await sendCallSignal(chatId, signal)
+    await api.sendCallSignal(chatId, signal)
   }
 
   /** Вызывается движком, когда от сервера пришло служебное сообщение звонка. */

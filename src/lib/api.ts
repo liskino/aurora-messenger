@@ -150,6 +150,31 @@ export async function measureRtt(): Promise<number> {
   return performance.now() - t0
 }
 
+/**
+ * Настройки ICE для звонков.
+ *
+ * Сервер отдаёт готовый список: STUN из интернета плюс встроенный TURN
+ * с уже сгенерированными учётными данными. Клиенту не нужно ничего
+ * настраивать — это и решает проблему звонков между разными сетями.
+ */
+export interface IceConfig {
+  iceServers: RTCIceServer[]
+}
+
+export async function fetchIceServers(): Promise<RTCIceServer[]> {
+  try {
+    const result = await get<IceConfig>('/api/ice')
+    return result.iceServers ?? []
+  } catch {
+    // Если сервер не ответил, звонок внутри одной сети всё равно возможен
+    // на публичных STUN-серверах.
+    return [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ]
+  }
+}
+
 // ─────────────────────────── вход и регистрация ───────────────────────────
 
 export interface AuthResult {

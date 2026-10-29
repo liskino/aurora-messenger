@@ -23,6 +23,7 @@
  * и держим в IndexedDB, поэтому дальше расшифровка мгновенная.
  */
 import * as api from './api'
+import { loadIceServers } from './rtc'
 import * as crypto from './crypto'
 import * as vault from './vault'
 import type { Chat, ChatMember, DecryptedMessage, Message, Profile } from './types'
@@ -281,6 +282,11 @@ export class Engine {
     } catch {
       // Список устройств — вспомогательная функция, вход из-за неё не срываем.
     }
+
+    // Настройки ICE загружаем при входе: сервер отдаёт встроенный TURN
+    // с готовыми учётными данными, чтобы звонки работали из любой сети
+    // без ручной настройки.
+    void loadIceServers()
 
     this.startPresence()
 
@@ -548,11 +554,17 @@ export class Engine {
 
   async decryptOne(m: Message, key: CryptoKey): Promise<DecryptedMessage> {
     try {
-      const text = await crypto.openTextAAD(
-        { ciphertext: m.ciphertext, iv: m.iv },
-        key,
-        aadFor(m.chat_id, m.sender_id),
-      )
+      // У файловых сообщений текстового шифротекста нет: содержимое шифруется
+      // отдельно блоками, а ciphertext пуст. Пытаться «расшифровать пустоту»
+      // нельзя — GCM упадёт на проверке тега, и файл пометится нерасшифрованным.
+      let text = ''
+      if (m.kind !== 'file' && m.ciphertext) {
+        text = await crypto.openTextAAD(
+          { ciphertext: m.ciphertext, iv: m.iv },
+          key,
+          aadFor(m.chat_id, m.sender_id),
+        )
+      }
       let fileName: string | undefined
       if (m.file_name_sealed && m.file_name_iv) {
         try {
